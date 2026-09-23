@@ -59,7 +59,9 @@ export const loginController = async (req: Request, res: Response) => {
                 3) If 1 & 2, reuse detection is needed to clear all RTs when user logs in
             */
 			const refreshToken = cookies.jwt;
-			const foundToken = await User.findOne({ refreshToken }).exec();
+			const foundToken = await User.findOne({
+				refreshTokens: refreshToken,
+			}).exec();
 
 			// Detected refresh token reuse!
 			if (!foundToken) {
@@ -130,13 +132,14 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 	const cookies = req.cookies;
 	if (!cookies?.jwt) return res.sendStatus(401);
 	const refreshToken = cookies.jwt;
+	console.log(refreshToken);
 	res.clearCookie("jwt", {
 		httpOnly: true,
 		sameSite: IS_PRODUCTION ? "none" : "lax",
 		secure: IS_PRODUCTION,
 	});
 
-	const foundUser = await User.findOne({ refreshToken }).exec();
+	const foundUser = await User.findOne({ refreshTokens: refreshToken }).exec();
 
 	// Detected refresh token reuse!
 	if (!foundUser) {
@@ -188,7 +191,7 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 			process.env.JWT_SECRET as string,
 		) as RefreshTokenPayload;
 
-		if (foundUser.username !== decoded.username) {
+		if (foundUser.email !== decoded.username) {
 			console.log("Token viejo e inválido (expirado o manipulado).");
 			return res.sendStatus(403);
 		}
