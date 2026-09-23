@@ -20,6 +20,10 @@ const userSchema = new Schema({
 		type: Boolean,
 		default: false,
 	},
+	refreshTokens: {
+		type: [String],
+		default: [],
+	},
 });
 const User = mongoose.model("User", userSchema);
 

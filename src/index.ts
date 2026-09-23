@@ -1,3 +1,4 @@
+import cookieParser from "cookie-parser";
 import cors from "cors";
 import express, { type Express, type Request, type Response } from "express";
 import { connectDb } from "./dbs/mongoDb.js";
@@ -13,6 +14,7 @@ app.use(
 
 const port = process.env.PORT || 3000;
 
+app.use(cookieParser());
 app.use(express.json());
 connectDb();
 app.get("/", (req: Request, res: Response) => {
