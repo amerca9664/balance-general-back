@@ -126,7 +126,7 @@ export const registerController = async (req: Request, res: Response) => {
 	}
 };
 
-const handleRefreshToken = async (req: Request, res: Response) => {
+export const handleRefreshToken = async (req: Request, res: Response) => {
 	const cookies = req.cookies;
 	if (!cookies?.jwt) return res.sendStatus(401);
 	const refreshToken = cookies.jwt;

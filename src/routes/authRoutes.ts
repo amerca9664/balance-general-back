@@ -1,5 +1,6 @@
 import { Router } from "express";
 import {
+	handleRefreshToken,
 	loginController,
 	logoutController,
 	registerController,
@@ -11,6 +12,7 @@ const authRouter: ReturnType<typeof Router> = Router();
 
 authRouter.post("/login", validate(loginSchema), loginController);
 authRouter.post("/register", validate(registerSchema), registerController);
+authRouter.post("/refresh", handleRefreshToken);
 authRouter.post("/logout", logoutController);
 
 export { authRouter };
