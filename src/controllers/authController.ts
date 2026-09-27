@@ -240,13 +240,19 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 				.json({ success: false, message: "Falta refresh token" });
 		}
 
+		// Uncondicional, como en el original: garantiza que ninguna salida de esta
+		// funcion deje viva una cookie vieja, incluidas las de error y el 500.
+		// Usa COOKIE_OPTIONS y no un literal porque el `path` tiene que ser identico
+		// al del res.cookie() del final; si divergen, el clear no borra nada y el
+		// token sigue viajando en cada request sin que se note.
+		res.clearCookie("jwt", COOKIE_OPTIONS);
+
 		const session = await RefreshTkModel.findOne({
 			tokenHash: hashRefreshToken(cookieRefreshToken),
 		});
 
 		if (!session) {
 			await handlePossibleReuse(cookieRefreshToken);
-			res.clearCookie("jwt", COOKIE_OPTIONS);
 			return res
 				.status(403)
 				.json({ success: false, message: "Refresh token inválido" });
@@ -256,7 +262,6 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 		// un rato. Lo borramos aca para no dejarlo huerfano.
 		if (session.expiresAt.getTime() < Date.now()) {
 			await RefreshTkModel.deleteOne({ _id: session._id });
-			res.clearCookie("jwt", COOKIE_OPTIONS);
 			return res
 				.status(403)
 				.json({ success: false, message: "Refresh token expirado" });
@@ -277,7 +282,6 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 			await RefreshTkModel.deleteMany({
 				idUser: decoded.id ?? session.idUser,
 			});
-			res.clearCookie("jwt", COOKIE_OPTIONS);
 			return res
 				.status(403)
 				.json({ success: false, message: "Refresh token manipulado" });
