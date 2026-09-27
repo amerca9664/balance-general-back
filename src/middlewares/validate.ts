@@ -1,7 +1,8 @@
 import type { NextFunction, Request, Response } from "express";
+import type { ZodType } from "zod";
 
 export const validate =
-	(schema) => (req: Request, res: Response, next: NextFunction) => {
+	(schema: ZodType) => (req: Request, res: Response, next: NextFunction) => {
 		try {
 			schema.parse(req.body);
 			next();
@@ -14,9 +15,9 @@ export const validate =
 	};
 
 export const validateQuery =
-	(schema) => (req: Request, res: Response, next: NextFunction) => {
+	(schema: ZodType) => (req: Request, res: Response, next: NextFunction) => {
 		try {
-			req.query = schema.parse(req.query);
+			schema.parse(req.query);
 			next();
 		} catch (error) {
 			return res.status(400).json({
