@@ -293,23 +293,51 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 			{ expiresIn: "1h" },
 		);
 
-		// Rotacion en el mismo documento: el _id no cambia, asi que el
-		// sessionId del access token sigue siendo valido. El token viejo
-		// deja de matchear el hash al instante.
+		// Rotacion in-place: el _id no cambia, asi que el sessionId del access
+		// token sigue siendo valido y el token viejo deja de matchear el hash.
 		const newRefreshToken = signRefreshToken(
 			String(session.idUser),
 			String(session._id),
 			String(decoded.username),
 		);
 
-		await RefreshTkModel.updateOne(
-			{ _id: session._id },
+		// El filtro incluye el hash VIEJO a proposito (compare-and-set). Filtrar
+		// solo por _id dejaba que dos requests concurrentes sobre la misma cookie
+		// escribieran las dos: la segunda machacaba el tokenHash de la primera y
+		// esa cookie quedaba muerta en el navegador. Su proximo refresh era un
+		// 403 -> handlePossibleReuse -> nuke-all de todas las sesiones. Con el
+		// hash viejo en el filtro solo uno gana; el otro ve modifiedCount 0 y se
+		// trata como reuse, que es lo que realmente es.
+		const previousHash = hashRefreshToken(cookieRefreshToken);
+		const rotation = await RefreshTkModel.updateOne(
+			{ _id: session._id, tokenHash: previousHash },
 			{
 				tokenHash: hashRefreshToken(newRefreshToken),
 				createdAt: new Date(),
 				expiresAt: getRefreshExpiry(),
 			},
 		);
+
+		if (rotation.modifiedCount === 0) {
+			// Perdio la carrera el CAS. NO es robo y por eso NO se nukea: el hash
+			// presentado matcheo hace un instante, asi que el token era valido y lo
+			// unico que paso es que otro request del MISMO cliente lo rotó primero
+			// (doble pestaña, retry, o el intervalo del front). Nuke-all aca te
+			// desloguearia de todos tus dispositivos por una carrera propia.
+			//
+			// Un token realmente robado nunca llega aca: fallaria antes, en el
+			// findOne por tokenHash, que es donde vive la deteccion de robo.
+			//
+			// Tampoco se borra la cookie: la respuesta perdedora puede llegar
+			// DESPUES de la ganadora, y su Set-Cookie de borrado pisaria el token
+			// bueno que acaba de emitir el ganador.
+			console.log(
+				"Rotación perdida: otro request del mismo cliente ya rotó esto.",
+			);
+			return res
+				.status(403)
+				.json({ success: false, message: "Refresh token ya rotado" });
+		}
 
 		res.cookie("jwt", newRefreshToken, {
 			...COOKIE_OPTIONS,
