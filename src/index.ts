@@ -17,7 +17,7 @@ const port = process.env.PORT || 3000;
 app.use(cookieParser());
 app.use(express.json());
 connectDb();
-app.get("/", (req: Request, res: Response) => {
+app.get("/", (_req: Request, res: Response) => {
 	res.status(200).send("Hello World!");
 });
 app.use("/api/auth", authRouter);

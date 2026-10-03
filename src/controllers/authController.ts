@@ -375,3 +375,12 @@ export const logoutController = async (req: Request, res: Response) => {
 			.json({ success: false, message: "Error interno del servidor" });
 	}
 };
+
+// Ruta protegida: verifyToken ya corrió, asi que req.user existe.
+export const meController = (req: Request, res: Response) => {
+	if (!req.user) {
+		return res.status(401).json({ success: false, message: "No autenticado" });
+	}
+
+	return res.status(200).json({ success: true, data: req.user });
+};
