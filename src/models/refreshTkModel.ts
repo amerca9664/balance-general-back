@@ -4,6 +4,7 @@ import mongoose from "mongoose";
 const { Schema } = mongoose;
 
 const REFRESH_TOKEN_TTL_DAYS = 6;
+const REFRESH_TOKEN_TTL_MS = REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000;
 const MAX_SESSIONS_PER_USER = 5;
 
 /**
@@ -23,7 +24,7 @@ export const hashRefreshToken = (rawToken: string): string =>
 	createHash("sha256").update(rawToken).digest("hex");
 
 export const getRefreshExpiry = (): Date =>
-	new Date(Date.now() + REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000);
+	new Date(Date.now() + REFRESH_TOKEN_TTL_MS);
 
 const refreshTkModelSchema = new Schema(
 	{
@@ -57,4 +58,4 @@ refreshTkModelSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 const RefreshTkModel = mongoose.model("RefreshTkModel", refreshTkModelSchema);
 
-export { MAX_SESSIONS_PER_USER, REFRESH_TOKEN_TTL_DAYS, RefreshTkModel };
+export { MAX_SESSIONS_PER_USER, REFRESH_TOKEN_TTL_MS, RefreshTkModel };

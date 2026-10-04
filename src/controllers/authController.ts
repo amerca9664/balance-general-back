@@ -8,6 +8,7 @@ import {
 	hashRefreshToken,
 	MAX_SESSIONS_PER_USER,
 	REFRESH_TOKEN_TTL_DAYS,
+	REFRESH_TOKEN_TTL_MS,
 	RefreshTkModel,
 } from "../models/refreshTkModel.js";
 import { User } from "../models/users.js";
@@ -187,7 +188,8 @@ export const loginController = async (req: Request, res: Response) => {
 
 		res.cookie("jwt", newRefreshToken, {
 			...COOKIE_OPTIONS,
-			maxAge: REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000,
+			maxAge: REFRESH_TOKEN_TTL_MS,
+			expires: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
 		});
 
 		return res
@@ -341,7 +343,8 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 
 		res.cookie("jwt", newRefreshToken, {
 			...COOKIE_OPTIONS,
-			maxAge: REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000,
+			maxAge: REFRESH_TOKEN_TTL_MS,
+			expires: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
 		});
 
 		return res
