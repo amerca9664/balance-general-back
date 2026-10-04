@@ -58,4 +58,9 @@ refreshTkModelSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 const RefreshTkModel = mongoose.model("RefreshTkModel", refreshTkModelSchema);
 
-export { MAX_SESSIONS_PER_USER, REFRESH_TOKEN_TTL_MS, RefreshTkModel };
+export {
+	MAX_SESSIONS_PER_USER,
+	REFRESH_TOKEN_TTL_DAYS,
+	REFRESH_TOKEN_TTL_MS,
+	RefreshTkModel,
+};
