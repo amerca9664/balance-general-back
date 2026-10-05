@@ -15,7 +15,7 @@ const authRouter: ReturnType<typeof Router> = Router();
 authRouter.post("/login", validate(loginSchema), loginController);
 authRouter.post(
 	"/register",
-	verifyToken,
+
 	validate(registerSchema),
 	registerController,
 );
