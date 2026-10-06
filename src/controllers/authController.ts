@@ -3,20 +3,17 @@ import type { Request, Response } from "express";
 import {
 	capSessions,
 	clearRefreshCookie,
+	getRefreshExpiry,
 	handlePossibleReuse,
+	hashRefreshToken,
+	SALT_ROUNDS,
 	setRefreshCookie,
 	signAccessToken,
 	signRefreshToken,
 	verifyRefreshToken,
 } from "../helpers/authHelper.js";
-import {
-	getRefreshExpiry,
-	hashRefreshToken,
-	RefreshTkModel,
-} from "../models/refreshTkModel.js";
+import { RefreshTkModel } from "../models/refreshTkModel.js";
 import { User } from "../models/users.js";
-
-const SALT_ROUNDS = parseInt(process.env.SALT_ROUNDS as string, 10) || 10;
 
 export const loginController = async (req: Request, res: Response) => {
 	try {
@@ -133,9 +130,10 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 
 		// Uncondicional, como en el original: garantiza que ninguna salida de esta
 		// funcion deje viva una cookie vieja, incluidas las de error y el 500.
-		// Usa COOKIE_OPTIONS y no un literal porque el `path` tiene que ser identico
-		// al del res.cookie() del final; si divergen, el clear no borra nada y el
-		// token sigue viajando en cada request sin que se note.
+		// Pasa por clearRefreshCookie y no por un literal: el `path` tiene que ser
+		// identico al del setRefreshCookie() del final (los dos comparten
+		// COOKIE_OPTIONS adentro del helper); si divergen, el clear no borra nada y
+		// el token sigue viajando en cada request sin que se note.
 		clearRefreshCookie(res);
 
 		const session = await RefreshTkModel.findOne({
@@ -246,7 +244,7 @@ export const logoutController = async (req: Request, res: Response) => {
 	try {
 		const cookieRefreshToken = req.cookies?.jwt;
 		if (cookieRefreshToken) {
-			// Antes esto no borraba nada: el token quedaba vivo 6 dias en la DB.
+			// Antes esto no borraba nada: el token quedaba vivo hasta el TTL en la DB.
 			await RefreshTkModel.deleteOne({
 				tokenHash: hashRefreshToken(cookieRefreshToken),
 			});

@@ -1,13 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { CookieOptions, Response } from "express";
 import jwt from "jsonwebtoken";
 import type { Types } from "mongoose";
-import {
-	MAX_SESSIONS_PER_USER,
-	REFRESH_TOKEN_TTL_DAYS,
-	REFRESH_TOKEN_TTL_MS,
-	RefreshTkModel,
-} from "../models/refreshTkModel.js";
+import { RefreshTkModel } from "../models/refreshTkModel.js";
 
 export interface RefreshTokenPayload extends jwt.JwtPayload {
 	id?: string;
@@ -29,6 +24,58 @@ const COOKIE_OPTIONS: CookieOptions = {
 };
 
 /**
+ * Lee una env var como entero positivo, con fallback.
+ *
+ * El ternario ingenuo (`env ? parseInt(env, 10) : fallback`) solo chequea
+ * truthiness, asi que `"abc"` produce `NaN` (no cae al fallback) y `"0"`
+ * produce `0`. Con `NaN`, `expiresIn` arma un JWT invalido y `jwt.sign`
+ * lanza; con `0`, el token sale ya expirado y `MAX_SESSIONS 0` vacia todas
+ * las sesiones en cada login. Un valor presente pero inutilizable tiene que
+ * caer al default, no colarse.
+ */
+const readPositiveIntEnv = (name: string, fallback: number): number => {
+	const raw = process.env[name];
+	if (!raw) return fallback;
+	const parsed = Number.parseInt(raw.trim(), 10);
+	return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const ACCESS_TOKEN_TTL_MINUTES = readPositiveIntEnv(
+	"ACCESS_TOKEN_TTL_MINUTES",
+	15,
+);
+const REFRESH_TOKEN_TTL_DAYS = readPositiveIntEnv("REFRESH_TOKEN_TTL_DAYS", 7);
+const REFRESH_TOKEN_TTL_MS = REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000;
+const MAX_SESSIONS_PER_USER = readPositiveIntEnv("MAX_SESSIONS_PER_USER", 5);
+
+// bcrypt solo acepta 4..31 rounds: por debajo es debil, por encima lanza y
+// rompe /register con un 500. El clamp evita que una env var mal escrita
+// tire el registro de usuarios.
+export const SALT_ROUNDS = Math.min(
+	31,
+	Math.max(4, readPositiveIntEnv("SALT_ROUNDS", 10)),
+);
+
+/**
+ * Hash DETERMINISTA a proposito.
+ *
+ * bcrypt no sirve aca: es salado, asi que no existe forma de armar
+ * `WHERE tokenHash = ?` con el token crudo que llega en la cookie.
+ * Solo podes hacer compare() contra un candidato que ya trajiste.
+ *
+ * SHA-256 si es determinista, asi que la busqueda es un lookup indexado.
+ * No lleva sal a proposito: el token tiene ~250 bits de entropia,
+ * no existe ataque de diccionario. La sal solo sirve para secretos
+ * de baja entropia (passwords) y rompe justamente la propiedad
+ * que nos permite buscar.
+ */
+export const hashRefreshToken = (rawToken: string): string =>
+	createHash("sha256").update(rawToken).digest("hex");
+
+export const getRefreshExpiry = (): Date =>
+	new Date(Date.now() + REFRESH_TOKEN_TTL_MS);
+
+/**
  * Firma un refresh token.
  *
  * El `jti` es lo que hace que cada rotacion produzca un token DISTINTO:
@@ -45,18 +92,19 @@ export const signRefreshToken = (
 	jwt.sign(
 		{ id: userId, username, sessionId, jti: randomUUID() },
 		process.env.JWT_SECRET as string,
-		// Template literal explicito: `6 + "d"` se ensancha a `string` y
-		// @types/jsonwebtoken v9 exige el tipo `${number}d`.
+		// Template literal explicito: `REFRESH_TOKEN_TTL_DAYS + "d"` se
+		// ensancha a `string` y @types/jsonwebtoken v9 exige el tipo
+		// `${number}d`.
 		{ expiresIn: `${REFRESH_TOKEN_TTL_DAYS}d` },
 	);
 
-/** Firma el access token de vida corta (1h) que viaja en la response body. */
+/** Firma el access token de vida corta (ACCESS_TOKEN_TTL_MINUTES) que viaja en la response body. */
 export const signAccessToken = (
 	id: unknown,
 	username: string | undefined,
 ): string =>
 	jwt.sign({ id, username }, process.env.JWT_SECRET as string, {
-		expiresIn: "1h",
+		expiresIn: ACCESS_TOKEN_TTL_MINUTES * 60, // en segundos
 	});
 
 /**
@@ -90,7 +138,8 @@ export const clearRefreshCookie = (res: Response): void => {
 /**
  * Tope de sesiones simultaneas por usuario.
  * Sin esto, un usuario que borra sus datos y vuelve a loguearse
- * acumula sesiones huerfanas hasta que el TTL las limpia (6 dias).
+ * acumula sesiones huerfanas hasta que el TTL las limpia
+ * (REFRESH_TOKEN_TTL_DAYS).
  */
 export const capSessions = async (idUser: Types.ObjectId): Promise<void> => {
 	const total = await RefreshTkModel.countDocuments({ idUser });
