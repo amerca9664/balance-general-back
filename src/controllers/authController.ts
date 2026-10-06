@@ -1,125 +1,22 @@
-import { randomUUID } from "node:crypto";
 import bcrypt from "bcrypt";
-import type { CookieOptions, Request, Response } from "express";
-import jwt from "jsonwebtoken";
-import type { Types } from "mongoose";
+import type { Request, Response } from "express";
+import {
+	capSessions,
+	clearRefreshCookie,
+	handlePossibleReuse,
+	setRefreshCookie,
+	signAccessToken,
+	signRefreshToken,
+	verifyRefreshToken,
+} from "../helpers/authHelper.js";
 import {
 	getRefreshExpiry,
 	hashRefreshToken,
-	MAX_SESSIONS_PER_USER,
-	REFRESH_TOKEN_TTL_DAYS,
-	REFRESH_TOKEN_TTL_MS,
 	RefreshTkModel,
 } from "../models/refreshTkModel.js";
 import { User } from "../models/users.js";
 
-interface RefreshTokenPayload extends jwt.JwtPayload {
-	id?: string;
-	username?: string;
-	sessionId?: string;
-}
-
-const SALT_ROUNDS = 10;
-const IS_PRODUCTION = process.env.NODE_ENV === "production";
-
-// Una sola fuente de verdad para setear Y limpiar la cookie.
-// Si el path no coincide, clearCookie() no borra nada y el token
-// sigue viajando en cada request.
-const COOKIE_OPTIONS: CookieOptions = {
-	httpOnly: true,
-	secure: IS_PRODUCTION,
-	sameSite: IS_PRODUCTION ? "none" : "lax",
-	// Scoped al router de auth: no viaja en cada llamada a la API.
-	path: "/api/auth",
-};
-
-/**
- * Firma un refresh token.
- *
- * El `jti` es lo que hace que cada rotacion produzca un token DISTINTO:
- * sin el, dos rotaciones dentro del mismo segundo generan el mismo payload
- * (id/username/sessionId/iat/exp iguales) y por lo tanto la misma firma, con
- * lo cual el token "viejo" seguiria siendo valido y la rotacion no cortaria
- * nada.
- */
-const signRefreshToken = (
-	userId: string,
-	sessionId: string,
-	username: string,
-): string =>
-	jwt.sign(
-		{ id: userId, username, sessionId, jti: randomUUID() },
-		process.env.JWT_SECRET as string,
-		// Template literal explicito: `6 + "d"` se ensancha a `string` y
-		// @types/jsonwebtoken v9 exige el tipo `${number}d`.
-		{ expiresIn: `${REFRESH_TOKEN_TTL_DAYS}d` },
-	);
-
-/**
- * Tope de sesiones simultaneas por usuario.
- * Sin esto, un usuario que borra sus datos y vuelve a loguearse
- * acumula sesiones huerfanas hasta que el TTL las limpia (6 dias).
- */
-const capSessions = async (idUser: Types.ObjectId): Promise<void> => {
-	const total = await RefreshTkModel.countDocuments({ idUser });
-	if (total <= MAX_SESSIONS_PER_USER) return;
-
-	const oldest = await RefreshTkModel.find({ idUser })
-		.sort({ createdAt: 1 })
-		.limit(total - MAX_SESSIONS_PER_USER)
-		.select("_id");
-
-	await RefreshTkModel.deleteMany({
-		_id: { $in: oldest.map((session) => session._id) },
-	});
-};
-
-/**
- * Reuse detection. La usan /login y /refresh, y la respuesta NO es la misma:
- *
- *   /refresh  -> 403. No hay password, solo el token, asi que la victima
- *                es el dueno del token y se le cortan todas sus sesiones.
- *   /login    -> 200. La password ya autentico a `user`, asi que el login
- *                continua: el nuke es un reset defensivo y despues se crea
- *                la sesion nueva de ese mismo usuario.
- *
- * En ambos casos el nuke es sobre `decoded.id` (dueno del token), NO sobre
- * quien esta autenticado. En el caso comun de login, la cookie vieja es del
- * mismo usuario que se esta autenticando, asi que `decoded.id === user._id`
- * y el efecto es reset + login limpio.
- *
- * El `await` con que loginController lo invoca es a proposito: sin esto el
- * deleteMany corre en paralelo al create de la sesion nueva y puede borrarla.
- *
- * Si el JWT ni siquiera verifica (firma invalida, otro secret, expirado) no
- * se toca nada, porque no hay a quien atribuirle el token. Eso cubre tambien
- * la cookie basura: nunca dispara un nuke.
- *
- * OJO, vector conocido: si la cookie trae un token valido de OTRO usuario, el
- * nuke cae sobre las sesiones de ese otro. Quien tenga tu cookie puede llamar
- * a /login con credenciales propias y borrarte las sesiones sin tu password.
- * Cerrarlo exige comparar `decoded.id` contra el usuario autenticado.
- */
-const handlePossibleReuse = async (rawToken: string): Promise<void> => {
-	let decoded: RefreshTokenPayload;
-	try {
-		decoded = jwt.verify(rawToken, process.env.JWT_SECRET as string, {
-			algorithms: ["HS256"],
-		}) as RefreshTokenPayload;
-	} catch {
-		// Firma invalida o expirado: no se puede atribuir a ningun usuario.
-		console.log("Refresh token expirado o manipulado.");
-		return;
-	}
-
-	if (!decoded.id) return;
-
-	console.log("🚨 ¡Intento de reutilización de Refresh Token detectado!");
-	await RefreshTkModel.deleteMany({ idUser: decoded.id });
-	console.log(
-		`🔒 Todas las sesiones invalidadas para: ${decoded.username ?? decoded.id}.`,
-	);
-};
+const SALT_ROUNDS = parseInt(process.env.SALT_ROUNDS as string, 10) || 10;
 
 export const loginController = async (req: Request, res: Response) => {
 	try {
@@ -156,14 +53,10 @@ export const loginController = async (req: Request, res: Response) => {
 				await handlePossibleReuse(cookieRefreshToken);
 			}
 
-			res.clearCookie("jwt", COOKIE_OPTIONS);
+			clearRefreshCookie(res);
 		}
 
-		const accessToken = jwt.sign(
-			{ id: user._id, username: user.email },
-			process.env.JWT_SECRET as string,
-			{ expiresIn: "1h" },
-		);
+		const accessToken = signAccessToken(user._id, user.email);
 
 		// Creamos la sesion primero para poder meter su _id en el JWT.
 		// El tokenHash se completa abajo, cuando ya tenemos el token firmado.
@@ -186,11 +79,7 @@ export const loginController = async (req: Request, res: Response) => {
 
 		await capSessions(user._id);
 
-		res.cookie("jwt", newRefreshToken, {
-			...COOKIE_OPTIONS,
-			maxAge: REFRESH_TOKEN_TTL_MS,
-			expires: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
-		});
+		setRefreshCookie(res, newRefreshToken);
 
 		return res
 			.status(200)
@@ -247,7 +136,7 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 		// Usa COOKIE_OPTIONS y no un literal porque el `path` tiene que ser identico
 		// al del res.cookie() del final; si divergen, el clear no borra nada y el
 		// token sigue viajando en cada request sin que se note.
-		res.clearCookie("jwt", COOKIE_OPTIONS);
+		clearRefreshCookie(res);
 
 		const session = await RefreshTkModel.findOne({
 			tokenHash: hashRefreshToken(cookieRefreshToken),
@@ -269,11 +158,15 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 				.json({ success: false, message: "Refresh token expirado" });
 		}
 
-		const decoded = jwt.verify(
-			cookieRefreshToken,
-			process.env.JWT_SECRET as string,
-			{ algorithms: ["HS256"] },
-		) as RefreshTokenPayload;
+		const decoded = verifyRefreshToken(cookieRefreshToken);
+		if (!decoded) {
+			// La sesion matcheo por hash pero el JWT no verifica: un doc vencido
+			// cuyo TTL de Mongo ainda no corrio. Antes esto caia en el catch y
+			// respondia 500; es un 403, el token simplemente ya no sirve.
+			return res
+				.status(403)
+				.json({ success: false, message: "Refresh token inválido" });
+		}
 
 		if (!decoded.id || String(session.idUser) !== decoded.id) {
 			// El token verifica con firma valida pero pertenece a otro usuario
@@ -289,11 +182,7 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 				.json({ success: false, message: "Refresh token manipulado" });
 		}
 
-		const accessToken = jwt.sign(
-			{ id: session.idUser, username: decoded.username },
-			process.env.JWT_SECRET as string,
-			{ expiresIn: "1h" },
-		);
+		const accessToken = signAccessToken(session.idUser, decoded.username);
 
 		// Rotacion in-place: el _id no cambia, asi que el sessionId del access
 		// token sigue siendo valido y el token viejo deja de matchear el hash.
@@ -341,11 +230,7 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 				.json({ success: false, message: "Refresh token ya rotado" });
 		}
 
-		res.cookie("jwt", newRefreshToken, {
-			...COOKIE_OPTIONS,
-			maxAge: REFRESH_TOKEN_TTL_MS,
-			expires: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
-		});
+		setRefreshCookie(res, newRefreshToken);
 
 		return res
 			.status(200)
@@ -367,7 +252,7 @@ export const logoutController = async (req: Request, res: Response) => {
 			});
 		}
 
-		res.clearCookie("jwt", COOKIE_OPTIONS);
+		clearRefreshCookie(res);
 
 		return res
 			.status(200)
