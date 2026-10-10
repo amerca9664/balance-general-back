@@ -6,6 +6,7 @@ import {
 	getRefreshExpiry,
 	handlePossibleReuse,
 	hashRefreshToken,
+	REFRESH_TOKEN_TTL_MS,
 	SALT_ROUNDS,
 	setRefreshCookie,
 	signAccessToken,
@@ -14,6 +15,57 @@ import {
 } from "../helpers/authHelper.js";
 import { RefreshTkModel } from "../models/refreshTkModel.js";
 import { User } from "../models/users.js";
+
+import { getRedisClient } from "../dbs/redis.js"; // Tu archivo anterior
+
+const MAX_SESIONES = 5;
+
+const insertarRefreshToken = async ({
+	rt,
+	userId,
+	sessionId,
+}: {
+	rt: string;
+	userId: string;
+	sessionId: string;
+}) => {
+	const redis = getRedisClient();
+	const tokenHash = hashRefreshToken(rt);
+
+	// 1. Claves separadas para los datos y para el índice de sesiones
+	const sessionDataKey = `session:${sessionId}`;
+	const userSessionsSetKey = `user:${userId}:sessions`;
+
+	const now = Date.now();
+	const ttlInSeconds = REFRESH_TOKEN_TTL_MS / 1000;
+	const expiracionTimestamp = now + REFRESH_TOKEN_TTL_MS;
+
+	// MULTI inicia una transacción atómica en Redis
+	const pipeline = redis.multi();
+
+	// A. Guardamos el token real con su TTL individual exacto
+	pipeline.set(sessionDataKey, tokenHash, "EX", ttlInSeconds);
+
+	// B. Añadimos la sesión al set del usuario. El SCORE es el timestamp de cuándo va a expirar
+	pipeline.zadd(userSessionsSetKey, expiracionTimestamp, sessionId);
+
+	// C. LIMPIEZA AUTOMÁTICA: Borramos del Set del usuario las sesiones que YA expiraron en el tiempo
+	pipeline.zremrangebyscore(userSessionsSetKey, "-inf", now);
+
+	// D. CONTROL DE TOPE: Si quedan más de 5, eliminamos las más viejas (las que expiran antes, índices del 0 hacia arriba)
+	// zremrangebyrank elimina por posición. Al indexar de 0 a -(MAX_SESIONES + 1), dejamos vivas solo las últimas 5 con mayor score
+	pipeline.zremrangebyrank(userSessionsSetKey, 0, -(MAX_SESIONES + 1));
+
+	// E. Renovamos el TTL del Set del usuario para que no quede huérfano si el usuario se vuelve inactivo
+	pipeline.expire(userSessionsSetKey, ttlInSeconds);
+
+	// Ejecutamos todo de un solo viaje al servidor Redis
+	await pipeline.exec();
+
+	console.log(
+		`Refresh Token y sesión ${sessionId} gestionados para el usuario: ${userId}`,
+	);
+};
 
 export const loginController = async (req: Request, res: Response) => {
 	try {
@@ -63,12 +115,19 @@ export const loginController = async (req: Request, res: Response) => {
 			expiresAt: getRefreshExpiry(),
 		});
 
+		const sessionId = crypto.randomUUID();
+
 		const newRefreshToken = signRefreshToken(
 			String(user._id),
 			String(session._id),
 			user.email,
+			sessionId,
 		);
-
+		await insertarRefreshToken({
+			rt: newRefreshToken,
+			userId: String(user._id),
+			sessionId,
+		});
 		await RefreshTkModel.updateOne(
 			{ _id: session._id },
 			{ tokenHash: hashRefreshToken(newRefreshToken) },
@@ -82,6 +141,7 @@ export const loginController = async (req: Request, res: Response) => {
 			.status(200)
 			.json({ success: true, message: "ok", token: accessToken });
 	} catch (_error) {
+		console.error(_error);
 		return res
 			.status(500)
 			.json({ success: false, message: "Error interno del servidor" });

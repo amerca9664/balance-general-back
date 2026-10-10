@@ -45,7 +45,8 @@ const ACCESS_TOKEN_TTL_MINUTES = readPositiveIntEnv(
 	15,
 );
 const REFRESH_TOKEN_TTL_DAYS = readPositiveIntEnv("REFRESH_TOKEN_TTL_DAYS", 7);
-const REFRESH_TOKEN_TTL_MS = REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000;
+export const REFRESH_TOKEN_TTL_MS =
+	REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000;
 const MAX_SESSIONS_PER_USER = readPositiveIntEnv("MAX_SESSIONS_PER_USER", 5);
 
 // bcrypt solo acepta 4..31 rounds: por debajo es debil, por encima lanza y
@@ -88,9 +89,10 @@ export const signRefreshToken = (
 	userId: string,
 	sessionId: string,
 	username: string,
+	tempSessionId: string,
 ): string =>
 	jwt.sign(
-		{ id: userId, username, sessionId, jti: randomUUID() },
+		{ id: userId, username, sessionId, jti: randomUUID(), tempSessionId },
 		process.env.JWT_SECRET as string,
 		// Template literal explicito: `REFRESH_TOKEN_TTL_DAYS + "d"` se
 		// ensancha a `string` y @types/jsonwebtoken v9 exige el tipo

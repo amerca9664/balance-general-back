@@ -3,6 +3,7 @@ import cors from "cors";
 import express, { type Express, type Request, type Response } from "express";
 import { connectDb } from "./dbs/mongoDb.js";
 import { authRouter } from "./routes/authRoutes.js";
+import { connectRedis } from "./dbs/redis.js";
 
 const app: Express = express();
 app.use(
@@ -17,6 +18,7 @@ const port = process.env.PORT || 3000;
 app.use(cookieParser());
 app.use(express.json());
 connectDb();
+connectRedis();
 app.get("/", (_req: Request, res: Response) => {
 	res.status(200).send("Hello World!");
 });
