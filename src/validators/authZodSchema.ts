@@ -42,7 +42,6 @@ export const bearerHeaderSchema = z
 export const accessTokenPayloadSchema = z.object({
 	id: z.string().min(1, "Token inválido"),
 	username: z.string().optional(),
-	sessionId: z.string().optional(),
 });
 
 export type LoginInput = z.infer<typeof loginSchema>;

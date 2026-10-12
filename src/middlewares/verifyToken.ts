@@ -73,11 +73,10 @@ export const verifyToken = (
 		});
 	}
 
-	const { id, username, sessionId } = payloadParsed.data;
+	const { id, username } = payloadParsed.data;
 	req.user = {
 		id,
 		username: username ?? "",
-		...(sessionId ? { sessionId } : {}),
 	};
 
 	return next();

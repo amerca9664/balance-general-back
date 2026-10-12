@@ -2,8 +2,8 @@ import cookieParser from "cookie-parser";
 import cors from "cors";
 import express, { type Express, type Request, type Response } from "express";
 import { connectDb } from "./dbs/mongoDb.js";
-import { authRouter } from "./routes/authRoutes.js";
 import { connectRedis } from "./dbs/redis.js";
+import { authRouter } from "./routes/authRoutes.js";
 
 const app: Express = express();
 app.use(

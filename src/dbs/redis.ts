@@ -12,7 +12,13 @@ const connectRedis = (): Redis => {
 		host: process.env.REDIS_HOST || "127.0.0.1",
 		port: parseInt(process.env.REDIS_PORT || "6379", 10),
 		username: process.env.REDIS_USER || "default",
-		password: process.env.REDIS_PASSWORD || "tu_contraseña_real",
+		// Solo mandamos AUTH si hay password real. El fallback anterior era un
+		// placeholder y contra un Redis local sin `requirepass` el server
+		// responde "ERR Client sent AUTH, but no password is set": todo
+		// createSession/getSessionByHash rechazaban y /login devolvia 500.
+		...(process.env.REDIS_PASSWORD
+			? { password: process.env.REDIS_PASSWORD }
+			: {}),
 		maxRetriesPerRequest: null,
 	});
 

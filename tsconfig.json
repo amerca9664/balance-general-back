@@ -40,5 +40,10 @@
     "noUncheckedSideEffectImports": true,
     "moduleDetection": "force",
     "skipLibCheck": true,
-  }
+  },
+
+  // `rootDir` es ./src, asi que `include` tiene que decir lo mismo. Sin esto
+  // corre el default `**/*` y cualquier .ts suelto en la raiz (scripts,
+  // tests) tira TS6059 porque queda fuera de rootDir.
+  "include": ["src"]
 }
