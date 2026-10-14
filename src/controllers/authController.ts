@@ -55,9 +55,12 @@ export const loginController = async (req: Request, res: Response) => {
 
 		setRefreshCookie(res, newRefreshToken);
 
-		return res
-			.status(200)
-			.json({ success: true, message: "ok", token: accessToken });
+		return res.status(200).json({
+			success: true,
+			message: "ok",
+			token: accessToken,
+			username: user.username,
+		});
 	} catch (_error) {
 		console.error(_error);
 		return res
