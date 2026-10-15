@@ -47,6 +47,16 @@ export const REFRESH_TOKEN_TTL_MS =
 	REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000;
 const MAX_SESSIONS_PER_USER = readPositiveIntEnv("MAX_SESSIONS_PER_USER", 5);
 
+// Ventana en la que un token recien rotado todavia se acepta como "doble
+// disparo del mismo cliente" en vez de tratarse como robo. Corta a proposito:
+// durante esos segundos, presentar un token ya rotado devuelve un access token
+// nuevo en vez de nukear. Trade-off deliberado contra el falso positivo del
+// doble-fire (dos refresh en paralelo con la misma cookie).
+const ROTATION_GRACE_SECONDS = readPositiveIntEnv("ROTATION_GRACE_SECONDS", 15);
+// Tope de saltos al seguir la cadena `rtr:` en rotaciones encadenadas
+// (3+ refresh simultaneos). Evita un loop si la cadena quedara corrupta.
+const MAX_ROTATION_GRACE_HOPS = 5;
+
 // bcrypt solo acepta 4..31 rounds: por debajo es debil, por encima lanza y
 // rompe /register con un 500. El clamp evita que una env var mal escrita
 // tire el registro de usuarios.
@@ -57,6 +67,9 @@ export const SALT_ROUNDS = Math.min(
 
 const rtKey = (tokenHash: string): string => `rt:${tokenHash}`;
 const userSessionsKey = (userId: string): string => `user:${userId}:sessions`;
+// Marca de rotacion reciente: hashViejo -> hashNuevo, con TTL corto. Es lo que
+// permite reconocer el doble-fire que llega DESPUES del ganador.
+const recentRotationKey = (tokenHash: string): string => `rtr:${tokenHash}`;
 const ttlSeconds = (): number => REFRESH_TOKEN_TTL_MS / 1000;
 
 /**
@@ -262,22 +275,59 @@ export const rotateSession = async ({
 			redis.call("ZREM", KEYS[3], ARGV[3])
 			redis.call("ZADD", KEYS[3], ARGV[4], ARGV[5])
 			redis.call("EXPIRE", KEYS[3], ARGV[2])
+			redis.call("SET", KEYS[4], ARGV[5], "EX", ARGV[6])
 			return 1
 		end
 		return 0
 		`,
-		3,
+		4,
 		rtKey(previousHash),
 		rtKey(nextHash),
 		userSessionsKey(userId),
+		recentRotationKey(previousHash),
 		userId,
 		String(ttlSeconds()),
 		previousHash,
 		String(Date.now() + REFRESH_TOKEN_TTL_MS),
 		nextHash,
+		String(ROTATION_GRACE_SECONDS),
 	);
 
 	return result === 1;
+};
+
+/**
+ * Resuelve si un token que ya no esta en `rt:` fue rotado hace instantes por el
+ * MISMO usuario. Sigue la cadena `rtr:` (hashViejo -> hashNuevo) hasta topar con
+ * una sesion viva del usuario:
+ *
+ *   - `rt:{next}` devuelve el userId  -> rotacion legitima, hay gracia.
+ *   - `rt:{next}` no existe           -> ese token tambien se rotó; seguir el
+ *                                        siguiente eslabon.
+ *   - `rt:{next}` es de OTRO usuario   -> manipulacion; sin gracia (se nukea).
+ *
+ * Devuelve `false` si no hay marca o si la cadena no lleva a una sesion del
+ * usuario: eso deja el camino libre al nuke de reuse.
+ */
+export const resolveRecentRotation = async (
+	previousHash: string,
+	userId: string,
+): Promise<boolean> => {
+	const redis = getRedisClient();
+	let current = previousHash;
+
+	for (let hop = 0; hop < MAX_ROTATION_GRACE_HOPS; hop++) {
+		const nextHash = await redis.get(recentRotationKey(current));
+		if (!nextHash) return false;
+
+		const owner = await getSessionByHash(nextHash);
+		if (owner === userId) return true;
+		if (owner !== null) return false;
+
+		current = nextHash;
+	}
+
+	return false;
 };
 
 export const deleteSessionByHash = async (
