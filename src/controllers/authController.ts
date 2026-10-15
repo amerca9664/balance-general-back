@@ -7,8 +7,8 @@ import {
 	deleteSessionByHash,
 	existingLoginTokenReuseLogic,
 	getSessionByHash,
+	handlePossibleReuse,
 	hashRefreshToken,
-	resolveRecentRotation,
 	rotateSession,
 	SALT_ROUNDS,
 	setRefreshCookie,
@@ -112,7 +112,7 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 
 		// NO se limpia la cookie de entrada de forma incondicional. Si dos
 		// requests del mismo cliente corren a la vez, uno gana el CAS y emite el
-		// token nuevo (setRefreshCookie del final); el perdedor no emite cookie.
+		// token nuevo (setRefreshCookie del final); el perdedor responde 403.
 		// Si el perdedor limpiara la cookie, su respuesta podria llegar DESPUES
 		// de la ganadora y borrar el token bueno que esa acaba de emitir. Cada
 		// salida que de verdad invalida la cookie la limpia en su propio branch.
@@ -133,22 +133,6 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 		// `EX` de la clave y el `exp` del JWT se fijaron en el mismo momento:
 		// si el JWT esta vivo, la clave tambien. Huele a replay => nuke.
 		if (!sessionUserId) {
-			// El hash no esta en `rt:`. Antes de gritar "reuse": puede ser el
-			// doble-fire que llego DESPUES del ganador, con la misma cookie vieja.
-			// Si el token fue rotado hace instantes por este mismo usuario, es un
-			// caso benigno: se responde 200 con un access token nuevo y NO se toca
-			// la cookie (la del ganador ya es la buena).
-			if (await resolveRecentRotation(previousHash, decoded.id)) {
-				console.log(
-					"Rotación reciente: doble disparo del mismo cliente, sin nuke.",
-				);
-				return res.status(200).json({
-					success: true,
-					message: "ok",
-					token: signAccessToken(decoded.id, decoded.username),
-				});
-			}
-
 			clearRefreshCookie(res);
 			// await handlePossibleReuse(cookieRefreshToken);
 			console.log("🚨 ¡Intento de reutilización de Refresh Token detectado!");
@@ -197,10 +181,6 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 			// Nuke-all aca te desloguearia de todos tus dispositivos por una
 			// carrera propia.
 			//
-			// Se responde 200 con un access token nuevo (no 403): para el cliente
-			// el doble refire es un exito, no un fallo, y el perdedor no puede
-			// quedarse esperando.
-			//
 			// Un token realmente robado nunca llega aca: fallaria antes, en
 			// getSessionByHash, que es donde vive la deteccion de robo.
 			//
@@ -211,8 +191,8 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 				"Rotación perdida: otro request del mismo cliente ya rotó esto.",
 			);
 			return res
-				.status(200)
-				.json({ success: true, message: "ok", token: accessToken });
+				.status(403)
+				.json({ success: false, message: "Refresh token ya rotado" });
 		}
 
 		setRefreshCookie(res, nextRefreshToken);
