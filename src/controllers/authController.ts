@@ -110,18 +110,16 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 				.json({ success: false, message: "Falta refresh token" });
 		}
 
-		// Uncondicional, como en el original: garantiza que ninguna salida de esta
-		// funcion deje viva una cookie vieja, incluidas las de error y el 500.
-		// Pasa por clearRefreshCookie y no por un literal: el `path` tiene que ser
-		// identico al del setRefreshCookie() del final (los dos comparten
-		// COOKIE_OPTIONS adentro del helper); si divergen, el clear no borra nada y
-		// el token sigue viajando en cada request sin que se note.
-		clearRefreshCookie(res);
-
-		// Si la firma no verifica, no hay a quien atribuirle el token y no se
-		// toca Redis.
+		// NO se limpia la cookie de entrada de forma incondicional. Si dos
+		// requests del mismo cliente corren a la vez, uno gana el CAS y emite el
+		// token nuevo (setRefreshCookie del final); el perdedor responde 403.
+		// Si el perdedor limpiara la cookie, su respuesta podria llegar DESPUES
+		// de la ganadora y borrar el token bueno que esa acaba de emitir. Cada
+		// salida que de verdad invalida la cookie la limpia en su propio branch.
 		const decoded = verifyRefreshToken(cookieRefreshToken);
 		if (!decoded?.id) {
+			// Firma invalida o expirado: la cookie es basura, se limpia.
+			clearRefreshCookie(res);
 			return res
 				.status(403)
 				.json({ success: false, message: "Refresh token inválido" });
@@ -135,6 +133,7 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 		// `EX` de la clave y el `exp` del JWT se fijaron en el mismo momento:
 		// si el JWT esta vivo, la clave tambien. Huele a replay => nuke.
 		if (!sessionUserId) {
+			clearRefreshCookie(res);
 			// await handlePossibleReuse(cookieRefreshToken);
 			console.log("🚨 ¡Intento de reutilización de Refresh Token detectado!");
 			await deleteAllSessions(decoded.id);
@@ -150,6 +149,7 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 			// La sesion dice pertenecer a otro usuario que el token firmado.
 			// Misma politica que el reuse: se revocan todos los tokens del
 			// dueno del token presentado.
+			clearRefreshCookie(res);
 			console.log("🚨 ¡Refresh token de otro usuario detectado!");
 			await deleteAllSessions(decoded.id);
 			return res
