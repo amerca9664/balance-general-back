@@ -138,27 +138,26 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 			// Si el token fue rotado hace instantes por este mismo usuario, es un
 			// caso benigno: se responde 200 con un access token nuevo y NO se toca
 			// la cookie (la del ganador ya es la buena).
-			if (await resolveRecentRotation(previousHash, decoded.id)) {
+			const isRecentRotation = await resolveRecentRotation(
+				previousHash,
+				decoded.id,
+			);
+			if (!isRecentRotation) {
+				clearRefreshCookie(res);
+				// await handlePossibleReuse(cookieRefreshToken);
+				console.log("🚨 ¡Intento de reutilización de Refresh Token detectado!");
+				await deleteAllSessions(decoded.id);
 				console.log(
-					"Rotación reciente: doble disparo del mismo cliente, sin nuke.",
+					`🔒 Todas las sesiones invalidadas para: ${decoded.username ?? decoded.id}.`,
 				);
-				return res.status(200).json({
-					success: true,
-					message: "ok",
-					token: signAccessToken(decoded.id, decoded.username),
-				});
+				return res
+					.status(403)
+					.json({ success: false, message: "Refresh token inválido" });
 			}
 
-			clearRefreshCookie(res);
-			// await handlePossibleReuse(cookieRefreshToken);
-			console.log("🚨 ¡Intento de reutilización de Refresh Token detectado!");
-			await deleteAllSessions(decoded.id);
 			console.log(
-				`🔒 Todas las sesiones invalidadas para: ${decoded.username ?? decoded.id}.`,
+				"Rotación reciente: doble disparo del mismo cliente, sin nuke.",
 			);
-			return res
-				.status(403)
-				.json({ success: false, message: "Refresh token inválido" });
 		}
 
 		if (sessionUserId !== decoded.id) {
