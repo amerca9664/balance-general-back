@@ -46,12 +46,24 @@ try {
 	console.log("\n--- rotate CAS ---");
 	check(
 		"rotate h1 -> h2 aceptado",
-		await h.rotateSession({ userId: uid, previousHash: h1, nextHash: h2 }),
+		await h.rotateSession({
+			userId: uid,
+			previousHash: h1,
+			nextHash: h2,
+			nextToken: "tok2",
+			nextJti: "jti-2",
+		}),
 		true,
 	);
 	check(
 		"rotate repetido (stale) rechazado",
-		await h.rotateSession({ userId: uid, previousHash: h1, nextHash: h3 }),
+		await h.rotateSession({
+			userId: uid,
+			previousHash: h1,
+			nextHash: h3,
+			nextToken: "tok3",
+			nextJti: "jti-3",
+		}),
 		false,
 	);
 	check("h1 borrado tras rotar", await h.getSessionByHash(h1), null);
@@ -63,6 +75,31 @@ try {
 	);
 	check("h3 nunca llego a existir", await h.getSessionByHash(h3), null);
 
+	console.log("\n--- ventana de gracia ---");
+	const grace = await h.getGraceSession(h1);
+	check("el puntero de gracia existe tras rotar", grace?.userId, uid);
+	check("el puntero trae el token vigente", grace?.token, "tok2");
+	check("el puntero trae el jti vigente", grace?.jti, "jti-2");
+	check("clave de gracia tiene TTL > 0", (await r.ttl(`rt:grace:${h1}`)) > 0, true);
+	check(
+		"resolveGraceReplay(h1) devuelve el token vigente",
+		(await h.resolveGraceReplay({ previousHash: h1, decodedId: uid }))?.token,
+		"tok2",
+	);
+	check(
+		"resolveGraceReplay con otro userId -> null",
+		await h.resolveGraceReplay({ previousHash: h1, decodedId: attacker }),
+		null,
+	);
+	check(
+		"resolveGraceReplay de un hash nunca rotado -> null",
+		await h.resolveGraceReplay({
+			previousHash: h.hashRefreshToken("nunca"),
+			decodedId: uid,
+		}),
+		null,
+	);
+
 	console.log("\n--- pertenencia cruzada ---");
 	check(
 		"rotate con userId ajeno rechazado",
@@ -70,6 +107,8 @@ try {
 			userId: attacker,
 			previousHash: h2,
 			nextHash: h.hashRefreshToken("tok4"),
+			nextToken: "tok4",
+			nextJti: "jti-4",
 		}),
 		false,
 	);
@@ -121,6 +160,11 @@ try {
 		await r.zcard(`user:${uid}:sessions`),
 		0,
 	);
+	check(
+		"la gracia no revive una sesion cerrada",
+		await h.resolveGraceReplay({ previousHash: h1, decodedId: uid }),
+		null,
+	);
 
 	console.log("\n--- nuke total ---");
 	await h.createSession({ userId: uid, tokenHash: h1 });
@@ -147,9 +191,11 @@ try {
 	console.error(err);
 } finally {
 	// Limpieza: tambien barre claves huerfanas de corridas anteriores.
+	// `includes` y no `startsWith`: las claves `rt:grace:*` guardan JSON con el
+	// userId adentro, no el userId pelado.
 	for (const k of await r.keys("rt:*")) {
 		const v = await r.get(k);
-		if (v?.startsWith("itest")) await r.del(k);
+		if (v?.includes("itest")) await r.del(k);
 	}
 	for (const k of await r.keys("user:itest*:sessions")) await r.del(k);
 	r.disconnect();
