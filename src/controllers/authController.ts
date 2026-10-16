@@ -115,11 +115,11 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 				.json({ success: false, message: "Falta refresh token" });
 		}
 
-		const jti = req.cookies?.jti;
+		const cookieJti = req.cookies?.jti;
 		const previousHash = hashRefreshToken(cookieRefreshToken);
 
 		const registered = await registerJti({
-			jti,
+			jti: cookieJti,
 			tokenHash: previousHash,
 		});
 
@@ -181,10 +181,12 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 
 		// Rotacion: el token viejo se borra y el nuevo toma su lugar en el
 		// indice, con un `jti` distinto que garantiza un hash distinto.
+
+		const newJti = crypto.randomUUID(); // Genera un identificador único para el token
 		const nextRefreshToken = signRefreshToken(
 			decoded.id,
 			decoded.username ?? "",
-			crypto.randomUUID(),
+			newJti,
 		);
 		const nextHash = hashRefreshToken(nextRefreshToken);
 
@@ -217,7 +219,7 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 		}
 
 		setRefreshCookie(res, nextRefreshToken);
-
+		setjti(res, newJti); // Establece la cookie con el identificador único del token
 		return res
 			.status(200)
 			.json({ success: true, message: "ok", token: accessToken });
