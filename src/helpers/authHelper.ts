@@ -84,9 +84,13 @@ export const hashRefreshToken = (rawToken: string): string =>
  * hash, con lo cual el token "viejo" seguiria matcheando y la rotacion no
  * cortaria nada.
  */
-export const signRefreshToken = (userId: string, username: string): string =>
+export const signRefreshToken = (
+	userId: string,
+	username: string,
+	jti: string,
+): string =>
 	jwt.sign(
-		{ id: userId, username, jti: randomUUID() },
+		{ id: userId, username, jti },
 		process.env.JWT_SECRET as string,
 		// Template literal explicito: `REFRESH_TOKEN_TTL_DAYS + "d"` se
 		// ensancha a `string` y @types/jsonwebtoken v9 exige el tipo
@@ -121,6 +125,14 @@ export const verifyRefreshToken = (
 
 export const setRefreshCookie = (res: Response, token: string): void => {
 	res.cookie("jwt", token, {
+		...COOKIE_OPTIONS,
+		maxAge: REFRESH_TOKEN_TTL_MS,
+		expires: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
+	});
+};
+
+export const setjti = (res: Response, jti: string): void => {
+	res.cookie("jti", jti, {
 		...COOKIE_OPTIONS,
 		maxAge: REFRESH_TOKEN_TTL_MS,
 		expires: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
@@ -385,4 +397,34 @@ export const existingLoginTokenReuseLogic = async (
 	// console.log(
 	// 	`🔒 Todas las sesiones invalidadas para: ${prior.username ?? prior.id}.`,
 	// );
+};
+
+export const registerJti = async ({
+	jti,
+	tokenHash,
+}: {
+	jti: string;
+	tokenHash: string;
+}): Promise<boolean> => {
+	const redis = getRedisClient();
+
+	const result = await redis.eval(
+		`
+		local existing = redis.call("GET", KEYS[1])
+
+		if existing then
+			return 0
+		end
+
+		redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
+
+		return 1
+		`,
+		1,
+		`refresh:jti:${jti}`,
+		tokenHash,
+		String(5),
+	);
+
+	return result === 1;
 };

@@ -9,8 +9,10 @@ import {
 	getSessionByHash,
 	handlePossibleReuse,
 	hashRefreshToken,
+	registerJti,
 	rotateSession,
 	SALT_ROUNDS,
+	setjti,
 	setRefreshCookie,
 	signAccessToken,
 	signRefreshToken,
@@ -46,7 +48,9 @@ export const loginController = async (req: Request, res: Response) => {
 
 		const accessToken = signAccessToken(user._id, user.email);
 
-		const newRefreshToken = signRefreshToken(String(user._id), user.email);
+		const jti = crypto.randomUUID(); // Genera un identificador único para el token
+
+		const newRefreshToken = signRefreshToken(String(user._id), user.email, jti);
 
 		await createSession({
 			userId: String(user._id),
@@ -54,6 +58,7 @@ export const loginController = async (req: Request, res: Response) => {
 		});
 
 		setRefreshCookie(res, newRefreshToken);
+		setjti(res, jti); // Establece la cookie con el identificador único del token
 
 		return res.status(200).json({
 			success: true,
@@ -110,6 +115,22 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 				.json({ success: false, message: "Falta refresh token" });
 		}
 
+		const jti = req.cookies?.jti;
+		const previousHash = hashRefreshToken(cookieRefreshToken);
+
+		const registered = await registerJti({
+			jti,
+			tokenHash: previousHash,
+		});
+
+		if (!registered) {
+			// El jti ya existe.
+			// No volver a rotar el refresh token.
+			return res
+				.status(409)
+				.json({ success: false, message: "Refresh token ya usado" });
+		}
+
 		// Uncondicional, como en el original: garantiza que ninguna salida de esta
 		// funcion deje viva una cookie vieja, incluidas las de error y el 500.
 		// Pasa por clearRefreshCookie y no por un literal: el `path` tiene que ser
@@ -127,7 +148,6 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 				.json({ success: false, message: "Refresh token inválido" });
 		}
 
-		const previousHash = hashRefreshToken(cookieRefreshToken);
 		const sessionUserId = await getSessionByHash(previousHash);
 
 		// El JWT verifica pero ese hash no esta en Redis: o nunca lo emitimos,
@@ -164,6 +184,7 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 		const nextRefreshToken = signRefreshToken(
 			decoded.id,
 			decoded.username ?? "",
+			crypto.randomUUID(),
 		);
 		const nextHash = hashRefreshToken(nextRefreshToken);
 
