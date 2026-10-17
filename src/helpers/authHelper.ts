@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import type { CookieOptions, Response } from "express";
 import jwt from "jsonwebtoken";
 import { getRedisClient } from "../dbs/redis.js";
@@ -6,6 +6,8 @@ import { getRedisClient } from "../dbs/redis.js";
 export interface RefreshTokenPayload extends jwt.JwtPayload {
 	id?: string;
 	username?: string;
+	/** Id de la sesion (familia de tokens) a la que pertenece este token. */
+	sid?: string;
 }
 
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
@@ -47,21 +49,16 @@ export const REFRESH_TOKEN_TTL_MS =
 	REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000;
 const MAX_SESSIONS_PER_USER = readPositiveIntEnv("MAX_SESSIONS_PER_USER", 5);
 
-// Ventana de gracia posterior a cada rotacion.
+// "Reuse interval" de Auth0 / "grace period" de Okta: cuantos segundos
+// despues de una rotacion se sigue aceptando el token anterior.
 //
-// El Set-Cookie de la rotacion puede perderse si el cliente navega (F5) con
-// la request en vuelo: Redis queda con el token nuevo y la cookie con el
-// viejo. Sin gracia, ese cliente "reutiliza" su propio token en el proximo
-// refresh y la reuse detection lo nukea. Dentro de este plazo se responde con
-// el token vigente en vez de castigar; fuera del plazo, reuse real.
-//
-// Excepcion sin plazo: si el sucesor directo del token presentado sigue vivo
-// (nunca se uso), el cliente solo perdio esa respuesta (F5 + 429 de
-// Cloudflare que bloqueo los reintentos) y se le reenvia el sucesor. Ver
-// resolveGraceReplay.
-const REFRESH_ROTATION_GRACE_SECONDS = readPositiveIntEnv(
-	"REFRESH_ROTATION_GRACE_SECONDS",
-	60,
+// Cubre las requests concurrentes con la misma cookie (F5 repetidos, dos
+// pestañas) y la respuesta perdida (F5 con el refresh en vuelo: el back rota
+// pero el navegador nunca guarda el Set-Cookie). Dentro del intervalo se
+// devuelve el token vigente; fuera, es reuso y se revoca esa sesion.
+const REFRESH_REUSE_INTERVAL_SECONDS = readPositiveIntEnv(
+	"REFRESH_REUSE_INTERVAL_SECONDS",
+	30,
 );
 
 // bcrypt solo acepta 4..31 rounds: por debajo es debil, por encima lanza y
@@ -72,17 +69,7 @@ export const SALT_ROUNDS = Math.min(
 	Math.max(4, readPositiveIntEnv("SALT_ROUNDS", 10)),
 );
 
-const rtKey = (tokenHash: string): string => `rt:${tokenHash}`;
-// Puntero de gracia: escrito en la MISMA escritura atomica que borra el token
-// viejo, asi que `rt:{hash} == null` implica `rt:grace:{hash} != null` (salvo
-// que la gracia ya venciera). No hay ventana en la que el token este muerto
-// y el puntero no exista.
-const graceKey = (tokenHash: string): string => `rt:grace:${tokenHash}`;
-// Hash del token que origino al token vivo (`rt:parent:{hijo} = padre`). Solo
-// sirve para que la siguiente rotacion recorte el puntero de gracia del abuelo
-// a la ventana corta: asi cada sesion guarda un solo puntero de vida larga en
-// vez de uno por rotacion.
-const parentKey = (tokenHash: string): string => `rt:parent:${tokenHash}`;
+const sessionKey = (sid: string): string => `session:${sid}`;
 const userSessionsKey = (userId: string): string => `user:${userId}:sessions`;
 const ttlSeconds = (): number => REFRESH_TOKEN_TTL_MS / 1000;
 
@@ -107,22 +94,29 @@ export const hashRefreshToken = (rawToken: string): string =>
  *
  * El `jti` es lo que hace que cada rotacion produzca un token DISTINTO:
  * sin el, dos rotaciones dentro del mismo segundo generan el mismo payload
- * (id/username/iat/exp iguales) y por lo tanto la misma firma y el mismo
- * hash, con lo cual el token "viejo" seguiria matcheando y la rotacion no
- * cortaria nada.
+ * y por lo tanto la misma firma y el mismo hash.
+ *
+ * `iat` va explicito para que la firma sea reproducible: con los mismos
+ * (userId, username, sid, jti, iat) HS256 da exactamente el mismo token. Asi
+ * el reuse interval puede reenviar el token vigente sin guardarlo crudo en
+ * Redis, solo su jti e iat.
  */
-export const signRefreshToken = (
-	userId: string,
-	username: string,
-	jti: string,
-): string =>
+export const signRefreshToken = ({
+	userId,
+	username,
+	sid,
+	jti,
+	iat,
+}: {
+	userId: string;
+	username: string;
+	sid: string;
+	jti: string;
+	iat: number;
+}): string =>
 	jwt.sign(
-		{ id: userId, username, jti },
+		{ id: userId, username, sid, jti, iat, exp: iat + ttlSeconds() },
 		process.env.JWT_SECRET as string,
-		// Template literal explicito: `REFRESH_TOKEN_TTL_DAYS + "d"` se
-		// ensancha a `string` y @types/jsonwebtoken v9 exige el tipo
-		// `${number}d`.
-		{ expiresIn: `${REFRESH_TOKEN_TTL_DAYS}d` },
 	);
 
 /** Firma el access token de vida corta (ACCESS_TOKEN_TTL_MINUTES) que viaja en la response body. */
@@ -158,416 +152,198 @@ export const setRefreshCookie = (res: Response, token: string): void => {
 	});
 };
 
-export const setjti = (res: Response, jti: string): void => {
-	res.cookie("jti", jti, {
-		...COOKIE_OPTIONS,
-		maxAge: REFRESH_TOKEN_TTL_MS,
-		expires: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
-	});
-};
-
 export const clearRefreshCookie = (res: Response): void => {
-	// Los DOS cookies de la sesion: si solo se limpia `jwt`, el `jti` huérfano
-	// sobrevive al logout y el proximo refresh arranca con un jti que ya estuvo
-	// en circulacion.
 	res.clearCookie("jwt", COOKIE_OPTIONS);
+	// Cookie `jti` de la version anterior: ya no se usa, se limpia para que
+	// no quede huerfana en los navegadores que la tienen.
 	res.clearCookie("jti", COOKIE_OPTIONS);
 };
 
 // ---------------------------------------------------------------------------
 // Session store (Redis, unica fuente de verdad)
 //
-//   rt:{sha256(token)}     STRING  value = userId      TTL = REFRESH_TOKEN_TTL
-//   user:{userId}:sessions ZSET    member = tokenHash   score = timestamp de expiracion
+//   session:{sid}          HASH  userId, current, previous, rotatedAt,
+//                                currentJti, currentIat     TTL = REFRESH_TOKEN_TTL
+//   user:{userId}:sessions ZSET  member = sid   score = timestamp de expiracion
 //
-// El indice va por el HASH DEL TOKEN, no por un id de sesion: es la traduccion
-// directa del `findOne({ tokenHash })` que tenia Mongo. Quien llega con la
-// cookie trae el token, asi que con hashearla ya sabe donde buscar y no hace
-// falta que el JWT cargue ninguna sesion.
+// Una sesion es una familia de refresh tokens: cada rotacion reemplaza
+// `current` y deja el anterior en `previous`. Los tokens se guardan
+// hasheados; `currentJti`/`currentIat` alcanzan para volver a firmar el
+// vigente (ver signRefreshToken).
 // ---------------------------------------------------------------------------
 
 /**
- * Ubica al dueno del token. `null` = ese token ya no existe: o nunca lo
- * emitimos, o ya fue rotado. Es el lookup que decide reuse.
- */
-export const getSessionByHash = async (
-	tokenHash: string,
-): Promise<string | null> => {
-	const redis = getRedisClient();
-	return redis.get(rtKey(tokenHash));
-};
-
-/**
- * Sucesor de un token rotado. `jti` se guarda junto para poder reenviar el
- * par cookie completo identico al que emitio la rotacion original, y
- * `rotatedAt` (ms) para medir la ventana de gracia.
- */
-export interface GraceSession {
-	userId: string;
-	token: string;
-	jti: string;
-	rotatedAt: number;
-}
-
-export const getGraceSession = async (
-	tokenHash: string,
-): Promise<GraceSession | null> => {
-	const raw = await getRedisClient().get(graceKey(tokenHash));
-	if (!raw) return null;
-
-	try {
-		const parsed = JSON.parse(raw) as Partial<GraceSession>;
-		if (
-			typeof parsed.userId !== "string" ||
-			typeof parsed.token !== "string" ||
-			typeof parsed.jti !== "string"
-		) {
-			return null;
-		}
-		return {
-			userId: parsed.userId,
-			token: parsed.token,
-			jti: parsed.jti,
-			// Punteros escritos antes de existir el campo: sin fecha no hay
-			// ventana, solo vale la regla del sucesor vivo.
-			rotatedAt: typeof parsed.rotatedAt === "number" ? parsed.rotatedAt : 0,
-		};
-	} catch {
-		return null;
-	}
-};
-
-/**
- * Decide si un token muerto todavia puede rescatarse por gracia.
- *
- * Devuelve el token vigente de la familia solo si el puntero de gracia del
- * hash presentado existe, le pertenece al mismo usuario que dice el JWT
- * presentado, y ademas se cumple UNA de estas dos:
- *
- *   1. Padre del token activo: el sucesor directo sigue vivo, o sea nunca se
- *      uso. Vale SIN limite de tiempo (dentro del `exp` del JWT). Es el caso
- *      del cliente que perdio la respuesta de la rotacion (F5 con la request
- *      en vuelo) y cuyos reintentos no llegaron al back (429 de Cloudflare):
- *      cuando vuelve, minutos despues, sigue con el token viejo. Nadie mas uso
- *      el sucesor, asi que no hay evidencia de robo, y entregarlo es el mismo
- *      riesgo que ya implica tener el padre. Es la regla que usa GoTrue
- *      (Supabase) para lo mismo.
- *   2. Dentro de REFRESH_ROTATION_GRACE_SECONDS desde la rotacion del token
- *      presentado: si el sucesor ya fue rotado a su vez (T1 -> T2 -> T3 en
- *      pocos segundos, F5 seguidos donde alguna respuesta si llego), se sigue
- *      la cadena de punteros hasta el token vivo.
- *
- * Fuera de eso (token viejo cuyo sucesor ya se uso, pasada la ventana) es
- * reuse real y quien llama nukea.
- *
- * El chequeo de que el token final siga vivo en Redis es el que impide que un
- * replay reviva una familia revocada por logout o por un nuke de reuse
- * detection: la sesion muerta no se puede reabrir con una cookie vieja.
- */
-const MAX_GRACE_HOPS = 10;
-
-export const resolveGraceReplay = async ({
-	previousHash,
-	decodedId,
-}: {
-	previousHash: string;
-	decodedId?: string;
-}): Promise<GraceSession | null> => {
-	let hash = previousHash;
-	let withinWindow = true;
-
-	for (let hop = 0; hop < MAX_GRACE_HOPS; hop++) {
-		const grace = await getGraceSession(hash);
-		if (!grace) return null;
-		if (decodedId !== undefined && grace.userId !== decodedId) return null;
-
-		const nextHash = hashRefreshToken(grace.token);
-		const alive = await getSessionByHash(nextHash);
-		if (alive === grace.userId) return grace;
-		if (alive !== null) return null;
-
-		// El sucesor ya se uso: seguir la cadena solo si el token PRESENTADO
-		// se roto hace menos que la ventana. Los saltos siguientes son
-		// rotaciones posteriores, asi que no vuelven a medirse.
-		if (hop === 0) {
-			withinWindow =
-				Date.now() - grace.rotatedAt <= REFRESH_ROTATION_GRACE_SECONDS * 1000;
-		}
-		if (!withinWindow) return null;
-
-		hash = nextHash;
-	}
-
-	return null;
-};
-
-/**
  * Crea la sesion y la anota en el indice del usuario, en UNA sola llamada
- * Lua (todo o nada):
- *
- *   - `SET ... EX` por clave: el token muere solo en el instante exacto en
- *     que vence, sin el desfasaje de ~60s que tiene el TTL collector de Mongo.
- *   - `ZRANGEBYSCORE -inf now`: saca del indice los tokens ya vencidos y
- *     tambien sus claves `rt:`, que vencieron junto con ellos.
- *   - `ZRANGE 0 total-max-1`: tope de sesiones simultaneas, dejando vivas las
- *     `MAX` que vencen mas tarde.
- *   - `EXPIRE` sobre el set: si el usuario queda inactivo el indice no queda
- *     como huerfano.
- *
- * Los `DEL` de los tokens expulsados van dentro del mismo script que los
- * `ZREM`, no aparte. Si se separaran, el tope quedaria con un hueco: la clave
- * `rt:` del token expulsado seguira viva, asi que ese token sigue pudiendo
- * refrescar, y como la rotacion vuelve a hacer `ZADD` en el indice, el tope
- * no limita nada con el tiempo. Peor: `deleteAllSessions` lee el ZSET, asi
- * que un token expulsado pero no borrado sobrevive a un nuke.
- *
- * El miembro nuevo se agrega ANTES de purgar y topar: su score es el mas alto
- * de todos, asi que nunca queda dentro del rango expulsado.
+ * Lua (todo o nada): purga del indice las sesiones vencidas y aplica el tope
+ * de MAX_SESSIONS_PER_USER, borrando las que vencen antes.
  */
 export const createSession = async ({
 	userId,
+	sid,
 	tokenHash,
+	jti,
+	iat,
 }: {
 	userId: string;
+	sid: string;
 	tokenHash: string;
+	jti: string;
+	iat: number;
 }): Promise<void> => {
 	const redis = getRedisClient();
 	const now = Date.now();
 
 	await redis.eval(
 		`
-		redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
-		redis.call("ZADD", KEYS[2], ARGV[3], ARGV[4])
+		redis.call("HSET", KEYS[1], "userId", ARGV[1], "current", ARGV[2],
+			"previous", "", "rotatedAt", ARGV[3], "currentJti", ARGV[4],
+			"currentIat", ARGV[5])
+		redis.call("EXPIRE", KEYS[1], ARGV[6])
+		redis.call("ZADD", KEYS[2], ARGV[7], ARGV[8])
 
-		local expired = redis.call("ZRANGEBYSCORE", KEYS[2], "-inf", ARGV[5])
+		local expired = redis.call("ZRANGEBYSCORE", KEYS[2], "-inf", ARGV[3])
 		for i = 1, #expired do
-			redis.call("DEL", ARGV[7] .. expired[i])
+			redis.call("DEL", ARGV[10] .. expired[i])
 			redis.call("ZREM", KEYS[2], expired[i])
 		end
 
-		local max = tonumber(ARGV[6])
+		local max = tonumber(ARGV[9])
 		local total = redis.call("ZCARD", KEYS[2])
 		if total > max then
 			local doomed = redis.call("ZRANGE", KEYS[2], 0, total - max - 1)
 			for i = 1, #doomed do
-				redis.call("DEL", ARGV[7] .. doomed[i])
+				redis.call("DEL", ARGV[10] .. doomed[i])
 				redis.call("ZREM", KEYS[2], doomed[i])
 			end
 		end
 
-		redis.call("EXPIRE", KEYS[2], ARGV[2])
+		redis.call("EXPIRE", KEYS[2], ARGV[6])
 		return 1
 		`,
 		2,
-		rtKey(tokenHash),
+		sessionKey(sid),
 		userSessionsKey(userId),
 		userId,
-		String(ttlSeconds()),
-		String(now + REFRESH_TOKEN_TTL_MS),
 		tokenHash,
 		String(now),
+		jti,
+		String(iat),
+		String(ttlSeconds()),
+		String(now + REFRESH_TOKEN_TTL_MS),
+		sid,
 		MAX_SESSIONS_PER_USER,
-		rtKey(""),
+		sessionKey(""),
 	);
 
 	console.log(`Sesión creada para el usuario: ${userId}`);
 };
 
+export type RefreshResult =
+	| { status: "rotated" }
+	| { status: "reused-in-interval"; jti: string; iat: number }
+	| { status: "reuse-detected" }
+	| { status: "not-found" };
+
 /**
- * Rotacion con compare-and-set atomico.
+ * Rotacion con reuse interval, atomica en un solo script Lua:
  *
- * El `GET == userId` (pertenenecia), el `DEL` del token viejo y el `SET` del
- * nuevo van dentro del MISMO script Lua, asi que son indivisibles: de dos
- * requests concurrentes con la misma cookie, UNA sola recibe 1. La otra
- * devuelve 0 y responde 403 sin nukear, porque haber encontrado el token hace
- * un instante prueba que era valido y lo unico que paso es que otro request
- * del mismo cliente lo roto primero (doble pestaña, retry, o el intervalo del
- * front).
- *
- * SIN este CAS, la segunda escritura dejaria el token viejo vivo y esa cookie
- * quedaria valida para siempre.
- *
- * El token realmente robado nunca llega aca: falla antes, en
- * `getSessionByHash`, que es donde vive la deteccion de robo.
- *
- * En el MISMO script se escribe el puntero de gracia `rt:grace:{previousHash}`
- * con el token nuevo: asi el DEL del viejo y el puntero que permite rescatar
- * a un cliente que perdio ese Set-Cookie son indivisibles.
- *
- * El puntero nuevo vive lo mismo que la sesion (la regla "padre del token
- * activo" no tiene plazo), y la misma rotacion recorta el puntero del abuelo
- * (`rt:parent:{previousHash}`) a la ventana corta: ese abuelo ya no es padre
- * de nadie vivo y solo le queda la gracia de la cadena.
+ *   - token == current  -> rota: previous = current, current = el nuevo.
+ *   - token == previous y la rotacion fue hace <= REFRESH_REUSE_INTERVAL ->
+ *     no rota; devuelve jti/iat del vigente para reenviarlo. De N requests
+ *     concurrentes con la misma cookie, una rota y las demas caen aca, asi
+ *     que todas terminan con el MISMO token.
+ *   - cualquier otro token de la sesion -> reuso: se borra la sesion. Solo
+ *     esa (la familia comprometida), no las demas sesiones del usuario.
  */
-export const rotateSession = async ({
+export const refreshSession = async ({
 	userId,
-	previousHash,
+	sid,
+	tokenHash,
 	nextHash,
-	nextToken,
 	nextJti,
+	nextIat,
 }: {
 	userId: string;
-	previousHash: string;
+	sid: string;
+	tokenHash: string;
 	nextHash: string;
-	nextToken: string;
 	nextJti: string;
-}): Promise<boolean> => {
+	nextIat: number;
+}): Promise<RefreshResult> => {
 	const redis = getRedisClient();
+	const now = Date.now();
 
-	const gracePayload = JSON.stringify({
-		userId,
-		token: nextToken,
-		jti: nextJti,
-		rotatedAt: Date.now(),
-	});
-
-	const result = await redis.eval(
+	const result = (await redis.eval(
 		`
-		if redis.call("GET", KEYS[1]) == ARGV[1] then
-			redis.call("DEL", KEYS[1])
-			redis.call("SET", KEYS[2], ARGV[1], "EX", ARGV[2])
-			redis.call("ZREM", KEYS[3], ARGV[3])
-			redis.call("ZADD", KEYS[3], ARGV[4], ARGV[5])
-			redis.call("EXPIRE", KEYS[3], ARGV[2])
-			redis.call("SET", KEYS[4], ARGV[6], "EX", ARGV[2])
-
-			local grandparent = redis.call("GET", KEYS[5])
-			if grandparent then
-				redis.call("EXPIRE", ARGV[8] .. grandparent, ARGV[7])
-				redis.call("DEL", KEYS[5])
-			end
-			redis.call("SET", KEYS[6], ARGV[3], "EX", ARGV[2])
-			return 1
+		local s = redis.call("HMGET", KEYS[1], "userId", "current", "previous",
+			"rotatedAt", "currentJti", "currentIat")
+		if not s[1] or s[1] ~= ARGV[1] then
+			return {"not-found"}
 		end
-		return 0
-		`,
-		6,
-		rtKey(previousHash),
-		rtKey(nextHash),
-		userSessionsKey(userId),
-		graceKey(previousHash),
-		parentKey(previousHash),
-		parentKey(nextHash),
-		userId,
-		String(ttlSeconds()),
-		previousHash,
-		String(Date.now() + REFRESH_TOKEN_TTL_MS),
-		nextHash,
-		gracePayload,
-		String(REFRESH_ROTATION_GRACE_SECONDS),
-		graceKey(""),
-	);
 
-	return result === 1;
+		if s[2] == ARGV[2] then
+			redis.call("HSET", KEYS[1], "previous", ARGV[2], "current", ARGV[3],
+				"rotatedAt", ARGV[4], "currentJti", ARGV[5], "currentIat", ARGV[6])
+			redis.call("EXPIRE", KEYS[1], ARGV[7])
+			redis.call("ZADD", KEYS[2], ARGV[8], ARGV[9])
+			redis.call("EXPIRE", KEYS[2], ARGV[7])
+			return {"rotated"}
+		end
+
+		if s[3] == ARGV[2] and tonumber(ARGV[4]) - tonumber(s[4]) <= tonumber(ARGV[10]) then
+			return {"reused-in-interval", s[5], s[6]}
+		end
+
+		redis.call("DEL", KEYS[1])
+		redis.call("ZREM", KEYS[2], ARGV[9])
+		return {"reuse-detected"}
+		`,
+		2,
+		sessionKey(sid),
+		userSessionsKey(userId),
+		userId,
+		tokenHash,
+		nextHash,
+		String(now),
+		nextJti,
+		String(nextIat),
+		String(ttlSeconds()),
+		String(now + REFRESH_TOKEN_TTL_MS),
+		sid,
+		String(REFRESH_REUSE_INTERVAL_SECONDS * 1000),
+	)) as string[];
+
+	const [status, jti, iat] = result;
+	if (status === "reused-in-interval") {
+		return { status, jti: jti as string, iat: Number(iat) };
+	}
+	return { status: status as "rotated" | "reuse-detected" | "not-found" };
 };
 
-export const deleteSessionByHash = async (
+/** Cierra una sesion puntual (logout). */
+export const deleteSession = async (
 	userId: string,
-	tokenHash: string,
+	sid: string,
 ): Promise<void> => {
 	const redis = getRedisClient();
 	await redis
 		.multi()
-		.del(rtKey(tokenHash))
-		.del(graceKey(tokenHash))
-		.del(parentKey(tokenHash))
-		.zrem(userSessionsKey(userId), tokenHash)
+		.del(sessionKey(sid))
+		.zrem(userSessionsKey(userId), sid)
 		.exec();
 };
 
 /**
- * Revoca TODOS los tokens del usuario. Sale del ZSET y no de un escaneo:
- * los miembros del set se limpian solos por score cada vez que se escribe, y
- * el set nunca vence antes que sus claves (su TTL se renueva en cada
- * escritura, asi que siempre >= el del token mas nuevo).
+ * Login con una cookie de refresh previa: cierra esa sesion vieja (si es del
+ * mismo usuario que dice el token) para que no quede colgada. El resto de las
+ * sesiones queda intacto.
  */
-export const deleteAllSessions = async (userId: string): Promise<void> => {
-	const redis = getRedisClient();
-	const key = userSessionsKey(userId);
-	const tokenHashes = await redis.zrange(key, "0", "-1");
-
-	const pipeline = redis.multi();
-	for (const hash of tokenHashes) {
-		pipeline.del(rtKey(hash));
-		pipeline.del(graceKey(hash));
-		pipeline.del(parentKey(hash));
-	}
-	pipeline.del(key);
-	await pipeline.exec();
-};
-
-/**
- * Reuse detection. La usan /login y /refresh, y la respuesta NO es la misma:
- *
- *   /refresh  -> 403. No hay password, solo el token, asi que la victima
- *                es el dueno del token y se le cortan todas sus sesiones.
- *   /login    -> 200. La password ya autentico a `user`, asi que el login
- *                continua: el nuke es un reset defensivo y despues se crea
- *                la sesion nueva de ese mismo usuario.
- *
- * En ambos casos el nuke es sobre `decoded.id` (dueno del token), NO sobre
- * quien esta autenticado. En el caso comun de login, la cookie vieja es del
- * mismo usuario que se esta autenticando, asi que `decoded.id === user._id`
- * y el efecto es reset + login limpio.
- *
- * El `await` con que loginController lo invoca es a proposito: sin esto el
- * delete corre en paralelo al create de la sesion nueva y puede borrarla.
- *
- * Si el JWT ni siquiera verifica (firma invalida, otro secret, expirado) no
- * se toca nada, porque no hay a quien atribuirle el token. Eso cubre tambien
- * la cookie basura: nunca dispara un nuke. Y cubre el vencimiento normal:
- * cuando la clave ya no existe, el JWT firmado en el mismo momento tampoco
- * verifica, asi que no se revoca nada.
- *
- * OJO, vector conocido: si la cookie trae un token valido de OTRO usuario, el
- * nuke cae sobre las sesiones de ese otro. Quien tenga tu cookie puede llamar
- * a /login con credenciales propias y borrarte las sesiones sin tu password.
- * Cerrarlo exige comparar `decoded.id` contra el usuario autenticado.
- */
-export const handlePossibleReuse = async (rawToken: string): Promise<void> => {
-	const decoded = verifyRefreshToken(rawToken);
-
-	if (!decoded) {
-		// Firma invalida o expirado: no se puede atribuir a ningun usuario.
-		console.log("Refresh token expirado o manipulado.");
-		return;
-	}
-
-	if (!decoded.id) return;
-
-	console.log("🚨 ¡Intento de reutilización de Refresh Token detectado!");
-	await deleteAllSessions(decoded.id);
-	console.log(
-		`🔒 Todas las sesiones invalidadas para: ${decoded.username ?? decoded.id}.`,
-	);
-};
-
-export const existingLoginTokenReuseLogic = async (
+export const closePreviousSession = async (
 	cookieRefreshToken: string,
-) => {
+): Promise<void> => {
 	const prior = verifyRefreshToken(cookieRefreshToken);
+	if (!prior?.id || !prior.sid) return;
 
-	if (!prior?.id) {
-		console.log("🚨 ¡Refresh token inválido detectado!");
-		return;
-	}
-
-	const priorHash = hashRefreshToken(cookieRefreshToken);
-	const priorUserId = await getSessionByHash(priorHash);
-
-	if (priorUserId === prior.id) {
-		// 2) La cookie es tuya: cerramos solo esa sesion, el resto queda intacto.
-		await deleteSessionByHash(priorUserId, priorHash);
-
-		console.log(
-			"🔒 Sesión previa cerrada: el refresh token presentado ya estaba en uso.",
-		);
-
-		return;
-	}
-	// console.log("🚨 ¡Intento de reutilización de Refresh Token detectado!");
-	// await deleteAllSessions(prior.id);
-	// console.log(
-	// 	`🔒 Todas las sesiones invalidadas para: ${prior.username ?? prior.id}.`,
-	// );
+	await deleteSession(prior.id, prior.sid);
+	console.log("🔒 Sesión previa cerrada al iniciar sesión de nuevo.");
 };

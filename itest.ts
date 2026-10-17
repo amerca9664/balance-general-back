@@ -15,178 +15,124 @@ const check = (name: string, got: unknown, want: unknown) => {
 		);
 };
 
+const tag = Date.now();
+const uid = `itest-${tag}`;
+const uid2 = `itest2-${tag}`;
+const attacker = `itest-attacker-${tag}`;
+const sids: string[] = [];
+
+/** Crea una sesion de prueba y devuelve su sid. */
+const newSession = async (userId: string, tokenHash: string) => {
+	const sid = `itest-sid-${tag}-${sids.length}`;
+	sids.push(sid);
+	await h.createSession({ userId, sid, tokenHash, jti: "jti-0", iat: 1 });
+	return sid;
+};
+
+const rotate = (userId: string, sid: string, from: string, to: string) =>
+	h.refreshSession({
+		userId,
+		sid,
+		tokenHash: h.hashRefreshToken(from),
+		nextHash: h.hashRefreshToken(to),
+		nextJti: `jti-${to}`,
+		nextIat: 100,
+	});
+
 try {
 	await r.ping();
 
-	const uid = `itest-${Date.now()}`;
-	const attacker = `itest-attacker-${Date.now()}`;
-	const h1 = h.hashRefreshToken("tok1");
-	const h2 = h.hashRefreshToken("tok2");
-	const h3 = h.hashRefreshToken("tok3");
-
-	console.log("--- create / lookup ---");
-	await h.createSession({ userId: uid, tokenHash: h1 });
+	console.log("--- create ---");
+	const sid = await newSession(uid, h.hashRefreshToken("tok1"));
+	check("la sesion existe", await r.hget(`session:${sid}`, "userId"), uid);
+	check("session: tiene TTL > 0", (await r.ttl(`session:${sid}`)) > 0, true);
 	check(
-		"getSessionByHash(h1) devuelve el userId",
-		await h.getSessionByHash(h1),
-		uid,
-	);
-	check(
-		"getSessionByHash desconocido -> null",
-		await h.getSessionByHash(h.hashRefreshToken("nunca")),
-		null,
-	);
-	check("clave rt: tiene TTL > 0", (await r.ttl(`rt:${h1}`)) > 0, true);
-	check(
-		"zset del usuario tiene 1 miembro",
-		await r.zcard(`user:${uid}:sessions`),
-		1,
+		"zset del usuario tiene el sid",
+		await r.zrange(`user:${uid}:sessions`, 0, -1),
+		[sid],
 	);
 
-	console.log("\n--- rotate CAS ---");
+	console.log("\n--- rotacion ---");
 	check(
-		"rotate h1 -> h2 aceptado",
-		await h.rotateSession({
-			userId: uid,
-			previousHash: h1,
-			nextHash: h2,
-			nextToken: "tok2",
-			nextJti: "jti-2",
-		}),
-		true,
+		"tok1 (current) rota",
+		(await rotate(uid, sid, "tok1", "tok2")).status,
+		"rotated",
 	);
 	check(
-		"rotate repetido (stale) rechazado",
-		await h.rotateSession({
-			userId: uid,
-			previousHash: h1,
-			nextHash: h3,
-			nextToken: "tok3",
-			nextJti: "jti-3",
-		}),
-		false,
-	);
-	check("h1 borrado tras rotar", await h.getSessionByHash(h1), null);
-	check("h2 vivo tras rotar", await h.getSessionByHash(h2), uid);
-	check(
-		"zset sin h1, con h2",
-		await r.zrange(`user:${uid}:sessions`, "0", "-1"),
-		[h2],
-	);
-	check("h3 nunca llego a existir", await h.getSessionByHash(h3), null);
-
-	console.log("\n--- ventana de gracia ---");
-	const grace = await h.getGraceSession(h1);
-	check("el puntero de gracia existe tras rotar", grace?.userId, uid);
-	check("el puntero trae el token vigente", grace?.token, "tok2");
-	check("el puntero trae el jti vigente", grace?.jti, "jti-2");
-	check(
-		"clave de gracia tiene TTL > 0",
-		(await r.ttl(`rt:grace:${h1}`)) > 0,
-		true,
+		"tok1 (previous) dentro del intervalo -> devuelve el vigente",
+		await rotate(uid, sid, "tok1", "tokX"),
+		{ status: "reused-in-interval", jti: "jti-tok2", iat: 100 },
 	);
 	check(
-		"resolveGraceReplay(h1) devuelve el token vigente",
-		(await h.resolveGraceReplay({ previousHash: h1, decodedId: uid }))?.token,
-		"tok2",
-	);
-	check(
-		"resolveGraceReplay con otro userId -> null",
-		await h.resolveGraceReplay({ previousHash: h1, decodedId: attacker }),
-		null,
-	);
-	check(
-		"resolveGraceReplay de un hash nunca rotado -> null",
-		await h.resolveGraceReplay({
-			previousHash: h.hashRefreshToken("nunca"),
-			decodedId: uid,
-		}),
-		null,
+		"el reuso en intervalo no roto nada",
+		await r.hget(`session:${sid}`, "current"),
+		h.hashRefreshToken("tok2"),
 	);
 
 	console.log("\n--- pertenencia cruzada ---");
 	check(
-		"rotate con userId ajeno rechazado",
-		await h.rotateSession({
-			userId: attacker,
-			previousHash: h2,
-			nextHash: h.hashRefreshToken("tok4"),
-			nextToken: "tok4",
-			nextJti: "jti-4",
-		}),
-		false,
+		"userId ajeno -> not-found",
+		(await rotate(attacker, sid, "tok2", "tok9")).status,
+		"not-found",
 	);
-	check("token de la victima queda intacto", await h.getSessionByHash(h2), uid);
 	check(
-		"atacante no tiene sesiones",
-		await r.zcard(`user:${attacker}:sessions`),
-		0,
+		"la sesion de la victima queda intacta",
+		await r.exists(`session:${sid}`),
+		1,
+	);
+	check(
+		"sid inexistente -> not-found",
+		(await rotate(uid, "nunca", "tok2", "tok9")).status,
+		"not-found",
+	);
+
+	console.log("\n--- reuso real ---");
+	const other = await newSession(uid, h.hashRefreshToken("otro1"));
+	check(
+		"tok2 rota a tok3",
+		(await rotate(uid, sid, "tok2", "tok3")).status,
+		"rotated",
+	);
+	check(
+		"tok1 (ya ni siquiera previous) -> reuse",
+		(await rotate(uid, sid, "tok1", "tokY")).status,
+		"reuse-detected",
+	);
+	check("se borro esa sesion", await r.exists(`session:${sid}`), 0);
+	check(
+		"tok3 ya no refresca",
+		(await rotate(uid, sid, "tok3", "tokZ")).status,
+		"not-found",
+	);
+	check(
+		"la OTRA sesion del usuario sobrevive",
+		await r.exists(`session:${other}`),
+		1,
+	);
+	check(
+		"zset solo con la otra",
+		await r.zrange(`user:${uid}:sessions`, 0, -1),
+		[other],
 	);
 
 	console.log("\n--- cap de sesiones ---");
-	const uid2 = `itest2-${Date.now()}`;
-	const capHashes: string[] = [];
-	for (let i = 0; i < 8; i++) {
-		const hash = h.hashRefreshToken(`cap-${i}`);
-		capHashes.push(hash);
-		await h.createSession({ userId: uid2, tokenHash: hash });
-	}
-	const aliveness = await Promise.all(
-		capHashes.map((x) => h.getSessionByHash(x)),
-	);
-	const aliveHashes = capHashes.filter((_, i) => aliveness[i] !== null);
+	const cap: string[] = [];
+	for (let i = 0; i < 8; i++)
+		cap.push(await newSession(uid2, h.hashRefreshToken(`cap-${i}`)));
+	const alive = await Promise.all(cap.map((s) => r.exists(`session:${s}`)));
 	check(
 		"8 creates -> el zset queda en 5",
 		await r.zcard(`user:${uid2}:sessions`),
 		5,
 	);
-	check("quedan exactamente 5 claves rt:", aliveHashes.length, 5);
-	check(
-		"sobreviven las 5 mas nuevas",
-		capHashes.slice(3).filter((x) => aliveHashes.includes(x)).length,
-		5,
-	);
-	check(
-		"murieron las 3 mas viejas",
-		capHashes.slice(0, 3).filter((x) => aliveHashes.includes(x)).length,
-		0,
-	);
+	check("sobreviven las 5 mas nuevas", alive, [0, 0, 0, 1, 1, 1, 1, 1]);
 
 	console.log("\n--- logout puntual ---");
-	await h.deleteSessionByHash(uid, h2);
+	await h.deleteSession(uid, other);
+	check("deleteSession borra la sesion", await r.exists(`session:${other}`), 0);
 	check(
-		"deleteSessionByHash borra la clave",
-		await h.getSessionByHash(h2),
-		null,
-	);
-	check(
-		"deleteSessionByHash limpia el zset",
+		"deleteSession limpia el zset",
 		await r.zcard(`user:${uid}:sessions`),
-		0,
-	);
-	check(
-		"la gracia no revive una sesion cerrada",
-		await h.resolveGraceReplay({ previousHash: h1, decodedId: uid }),
-		null,
-	);
-
-	console.log("\n--- nuke total ---");
-	await h.createSession({ userId: uid, tokenHash: h1 });
-	await h.createSession({ userId: uid, tokenHash: h2 });
-	await h.createSession({ userId: uid, tokenHash: h3 });
-	check("3 sesiones creadas", await r.zcard(`user:${uid}:sessions`), 3);
-	await h.deleteAllSessions(uid);
-	check("nuke borra h1", await h.getSessionByHash(h1), null);
-	check("nuke borra h2", await h.getSessionByHash(h2), null);
-	check("nuke borra h3", await h.getSessionByHash(h3), null);
-	check("nuke vacia el zset", await r.zcard(`user:${uid}:sessions`), 0);
-	await h.deleteAllSessions(uid2);
-	check("nuke del usuario 2", await r.zcard(`user:${uid2}:sessions`), 0);
-	check(
-		"nuke alcanza a los 5 sobrevivientes del cap",
-		(await Promise.all(capHashes.map((x) => h.getSessionByHash(x)))).filter(
-			(x) => x !== null,
-		).length,
 		0,
 	);
 } catch (err) {
@@ -194,14 +140,8 @@ try {
 	console.log("FAIL  excepcion");
 	console.error(err);
 } finally {
-	// Limpieza: tambien barre claves huerfanas de corridas anteriores.
-	// `includes` y no `startsWith`: las claves `rt:grace:*` guardan JSON con el
-	// userId adentro, no el userId pelado.
-	for (const k of await r.keys("rt:*")) {
-		const v = await r.get(k);
-		if (v?.includes("itest")) await r.del(k);
-	}
-	for (const k of await r.keys("user:itest*:sessions")) await r.del(k);
+	for (const s of sids) await r.del(`session:${s}`);
+	for (const u of [uid, uid2, attacker]) await r.del(`user:${u}:sessions`);
 	r.disconnect();
 }
 

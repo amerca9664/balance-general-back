@@ -1,25 +1,22 @@
+import { randomUUID } from "node:crypto";
 import bcrypt from "bcrypt";
 import type { Request, Response } from "express";
 import {
 	clearRefreshCookie,
+	closePreviousSession,
 	createSession,
-	deleteAllSessions,
-	deleteSessionByHash,
-	existingLoginTokenReuseLogic,
-	type GraceSession,
-	getSessionByHash,
+	deleteSession,
 	hashRefreshToken,
-	type RefreshTokenPayload,
-	resolveGraceReplay,
-	rotateSession,
+	refreshSession,
 	SALT_ROUNDS,
-	setjti,
 	setRefreshCookie,
 	signAccessToken,
 	signRefreshToken,
 	verifyRefreshToken,
 } from "../helpers/authHelper.js";
 import { User } from "../models/users.js";
+
+const nowSeconds = (): number => Math.floor(Date.now() / 1000);
 
 export const loginController = async (req: Request, res: Response) => {
 	try {
@@ -41,25 +38,33 @@ export const loginController = async (req: Request, res: Response) => {
 		}
 
 		if (cookieRefreshToken) {
-			// La busqueda es por el hash de la cookie: no hace falta confiar en
-			// nada que diga el JWT para saber si esa sesion existe.
-			await existingLoginTokenReuseLogic(cookieRefreshToken);
+			await closePreviousSession(cookieRefreshToken);
 			clearRefreshCookie(res);
 		}
 
 		const accessToken = signAccessToken(user._id, user.email);
 
-		const jti = crypto.randomUUID(); // Genera un identificador único para el token
-
-		const newRefreshToken = signRefreshToken(String(user._id), user.email, jti);
+		// Una sesion nueva = una familia nueva de refresh tokens.
+		const sid = randomUUID();
+		const jti = randomUUID();
+		const iat = nowSeconds();
+		const newRefreshToken = signRefreshToken({
+			userId: String(user._id),
+			username: user.email,
+			sid,
+			jti,
+			iat,
+		});
 
 		await createSession({
 			userId: String(user._id),
+			sid,
 			tokenHash: hashRefreshToken(newRefreshToken),
+			jti,
+			iat,
 		});
 
 		setRefreshCookie(res, newRefreshToken);
-		setjti(res, jti); // Establece la cookie con el identificador único del token
 
 		return res.status(200).json({
 			success: true,
@@ -107,29 +112,6 @@ export const registerController = async (req: Request, res: Response) => {
 	}
 };
 
-/**
- * Replay dentro de la ventana de gracia: reenvia el par de cookies vigente
- * (el mismo que emitio la rotacion original) y un access token nuevo.
- *
- * Es idempotente: no rota ni cambia nada en Redis, asi que dos requests que
- * rescaten al mismo cliente desfasado reciben exactamente el mismo token y
- * el cookie jar termina consistente sin importar el orden en que lleguen.
- */
-const replyWithGraceSession = (
-	res: Response,
-	grace: GraceSession,
-	decoded: RefreshTokenPayload,
-) => {
-	setRefreshCookie(res, grace.token);
-	setjti(res, grace.jti);
-
-	const accessToken = signAccessToken(decoded.id, decoded.username);
-
-	return res
-		.status(200)
-		.json({ success: true, message: "ok", token: accessToken });
-};
-
 export const handleRefreshToken = async (req: Request, res: Response) => {
 	try {
 		const cookieRefreshToken = req.cookies?.jwt;
@@ -139,136 +121,71 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 				.json({ success: false, message: "Falta refresh token" });
 		}
 
-		const previousHash = hashRefreshToken(cookieRefreshToken);
-
-		// Firma primero: sin un payload verificado no hay a quien atribuirle el
-		// token, y un token basura tampoco tiene por que quemar un jti.
+		// Si la firma no verifica, no hay a quien atribuirle el token y no se
+		// toca Redis. Los tokens sin `sid` son de antes de las sesiones por
+		// familia: se rechazan y el usuario vuelve a loguearse una vez.
 		const decoded = verifyRefreshToken(cookieRefreshToken);
-		if (!decoded?.id) {
+		if (!decoded?.id || !decoded.sid) {
 			clearRefreshCookie(res);
 			return res
 				.status(403)
 				.json({ success: false, message: "Refresh token inválido" });
 		}
 
-		const sessionUserId = await getSessionByHash(previousHash);
-
-		if (sessionUserId && sessionUserId !== decoded.id) {
-			// La sesion dice pertenecer a otro usuario que el token firmado.
-			// Misma politica que la reuse: se revocan todos los tokens del
-			// dueno del token presentado.
-			console.log("🚨 ¡Refresh token de otro usuario detectado!");
-			await deleteAllSessions(decoded.id);
-			clearRefreshCookie(res);
-			return res
-				.status(403)
-				.json({ success: false, message: "Refresh token manipulado" });
-		}
-
-		if (!sessionUserId) {
-			// El JWT verifica pero ese hash ya no esta activo: o nunca lo
-			// emitimos, o ya fue rotado.
-			//
-			// Primero la gracia: si la rotacion fue hace segundos, lo mas
-			// probable es el propio cliente cuyo Set-Cookie se perdio (F5 con
-			// la request en vuelo), no un robo. Se le devuelve el token
-			// vigente y listo.
-			const grace = await resolveGraceReplay({
-				previousHash,
-				decodedId: decoded.id,
-			});
-			if (grace) {
-				console.log("Gracia: cliente resincronizado con el token vigente.");
-				return replyWithGraceSession(res, grace, decoded);
-			}
-
-			// Con Redis esto NO es el vencimiento normal, porque el `EX` de la
-			// clave y el `exp` del JWT se fijaron en el mismo momento: si el
-			// JWT esta vivo, la clave tambien. Huele a replay => nuke.
-			console.log("🚨 ¡Intento de reutilización de Refresh Token detectado!");
-			await deleteAllSessions(decoded.id);
-			console.log(
-				`🔒 Todas las sesiones invalidadas para: ${decoded.username ?? decoded.id}.`,
-			);
-			clearRefreshCookie(res);
-			return res
-				.status(403)
-				.json({ success: false, message: "Refresh token inválido" });
-		}
-
-		// La sesion esta activa y es del dueño del token: rotacion en curso.
-		//
-		// Sin dedup previo por jti: el CAS de rotateSession ya garantiza que de
-		// N requests concurrentes con el mismo token solo una rote, y como el
-		// puntero de gracia se escribe en el MISMO script que borra el token
-		// viejo, las perdedoras siempre lo encuentran y reciben el token
-		// vigente (200). Un dedup aparte respondia 409 ANTES de que existiera
-		// la gracia, y el front se quedaba sin access token.
-
-		// Si la rotacion no llega a completarse, ninguna salida posterior deja
-		// viva la cookie vieja (incluidas las de error y el 500): pasa por
-		// clearRefreshCookie y no por un literal, porque el `path` tiene que
-		// ser identico al del setRefreshCookie() del final (los dos comparten
-		// COOKIE_OPTIONS adentro del helper); si divergen, el clear no borra
-		// nada y el token sigue viajando en cada request sin que se note.
-		clearRefreshCookie(res);
-
-		const accessToken = signAccessToken(decoded.id, decoded.username);
-
-		// Rotacion: el token viejo se borra y el nuevo toma su lugar en el
-		// indice, con un `jti` distinto que garantiza un hash distinto.
-
-		const newJti = crypto.randomUUID(); // Genera un identificador único para el token
-		const nextRefreshToken = signRefreshToken(
-			decoded.id,
-			decoded.username ?? "",
-			newJti,
-		);
-		const nextHash = hashRefreshToken(nextRefreshToken);
-
-		const rotated = await rotateSession({
+		const username = decoded.username ?? "";
+		const nextJti = randomUUID();
+		const nextIat = nowSeconds();
+		const nextRefreshToken = signRefreshToken({
 			userId: decoded.id,
-			previousHash,
-			nextHash,
-			nextToken: nextRefreshToken,
-			nextJti: newJti,
+			username,
+			sid: decoded.sid,
+			jti: nextJti,
+			iat: nextIat,
 		});
 
-		if (!rotated) {
-			// Perdio la carrera el CAS. NO es robo y por eso NO se nukea: el
-			// token matcheo en Redis hace un instante, asi que era valido y lo
-			// unico que paso es que otro request del MISMO cliente lo rotó
-			// primero (doble pestaña, retry, o el intervalo del front).
-			// Nuke-all aca te desloguearia de todos tus dispositivos por una
-			// carrera propia.
-			//
-			// Ese ganador dejo ademas el puntero de gracia con su token, asi
-			// que lo mas probable es poder resincronizar al cliente aca mismo.
-			const grace = await resolveGraceReplay({
-				previousHash,
-				decodedId: decoded.id,
-			});
-			if (grace) {
-				console.log("Rotación perdida: resincronizado con el token vigente.");
-				return replyWithGraceSession(res, grace, decoded);
-			}
+		const result = await refreshSession({
+			userId: decoded.id,
+			sid: decoded.sid,
+			tokenHash: hashRefreshToken(cookieRefreshToken),
+			nextHash: hashRefreshToken(nextRefreshToken),
+			nextJti,
+			nextIat,
+		});
 
-			// Tampoco se vuelve a setear la cookie: la respuesta perdedora puede
-			// llegar DESPUES de la ganadora, y su Set-Cookie pisaria el token
-			// bueno que acaba de emitir el ganador.
+		if (result.status === "reuse-detected") {
+			// Token viejo fuera del reuse interval: la familia esta
+			// comprometida y ya se revoco esa sesion (solo esa).
 			console.log(
-				"Rotación perdida: otro request del mismo cliente ya rotó esto.",
+				`🚨 Reuso de refresh token: sesión ${decoded.sid} revocada (${username || decoded.id}).`,
 			);
-			return res
-				.status(403)
-				.json({ success: false, message: "Refresh token ya rotado" });
 		}
 
-		setRefreshCookie(res, nextRefreshToken);
-		setjti(res, newJti); // Establece la cookie con el identificador único del token
-		return res
-			.status(200)
-			.json({ success: true, message: "ok", token: accessToken });
+		if (result.status === "reuse-detected" || result.status === "not-found") {
+			clearRefreshCookie(res);
+			return res
+				.status(403)
+				.json({ success: false, message: "Refresh token inválido" });
+		}
+
+		// Dentro del reuse interval se reenvia el token vigente, re-firmado
+		// con su jti/iat: es identico al que emitio la rotacion original.
+		const refreshTokenToSend =
+			result.status === "rotated"
+				? nextRefreshToken
+				: signRefreshToken({
+						userId: decoded.id,
+						username,
+						sid: decoded.sid,
+						jti: result.jti,
+						iat: result.iat,
+					});
+
+		setRefreshCookie(res, refreshTokenToSend);
+		return res.status(200).json({
+			success: true,
+			message: "ok",
+			token: signAccessToken(decoded.id, decoded.username),
+		});
 	} catch (_error) {
 		console.error(_error);
 		return res
@@ -281,24 +198,9 @@ export const logoutController = async (req: Request, res: Response) => {
 	try {
 		const cookieRefreshToken = req.cookies?.jwt;
 		if (cookieRefreshToken) {
-			// Busqueda por hash, como el deleteOne({tokenHash}) original: si el
-			// token no esta en Redis no hay nada que borrar, y si esta es
-			// porque lo emitimos nosotros para esa sesion.
-			const tokenHash = hashRefreshToken(cookieRefreshToken);
-			const userId = await getSessionByHash(tokenHash);
-			if (userId) {
-				await deleteSessionByHash(userId, tokenHash);
-			} else {
-				// Cookie desfasada (se perdio el Set-Cookie de la ultima
-				// rotacion): igual hay que cortar la sesion vigente a la que
-				// apunta el puntero de gracia, o el logout no revocaria nada.
-				const grace = await resolveGraceReplay({ previousHash: tokenHash });
-				if (grace) {
-					await deleteSessionByHash(
-						grace.userId,
-						hashRefreshToken(grace.token),
-					);
-				}
+			const decoded = verifyRefreshToken(cookieRefreshToken);
+			if (decoded?.id && decoded.sid) {
+				await deleteSession(decoded.id, decoded.sid);
 			}
 		}
 
