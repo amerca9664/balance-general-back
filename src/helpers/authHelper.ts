@@ -54,6 +54,11 @@ const MAX_SESSIONS_PER_USER = readPositiveIntEnv("MAX_SESSIONS_PER_USER", 5);
 // viejo. Sin gracia, ese cliente "reutiliza" su propio token en el proximo
 // refresh y la reuse detection lo nukea. Dentro de este plazo se responde con
 // el token vigente en vez de castigar; fuera del plazo, reuse real.
+//
+// Excepcion sin plazo: si el sucesor directo del token presentado sigue vivo
+// (nunca se uso), el cliente solo perdio esa respuesta (F5 + 429 de
+// Cloudflare que bloqueo los reintentos) y se le reenvia el sucesor. Ver
+// resolveGraceReplay.
 const REFRESH_ROTATION_GRACE_SECONDS = readPositiveIntEnv(
 	"REFRESH_ROTATION_GRACE_SECONDS",
 	60,
@@ -73,6 +78,11 @@ const rtKey = (tokenHash: string): string => `rt:${tokenHash}`;
 // que la gracia ya venciera). No hay ventana en la que el token este muerto
 // y el puntero no exista.
 const graceKey = (tokenHash: string): string => `rt:grace:${tokenHash}`;
+// Hash del token que origino al token vivo (`rt:parent:{hijo} = padre`). Solo
+// sirve para que la siguiente rotacion recorte el puntero de gracia del abuelo
+// a la ventana corta: asi cada sesion guarda un solo puntero de vida larga en
+// vez de uno por rotacion.
+const parentKey = (tokenHash: string): string => `rt:parent:${tokenHash}`;
 const userSessionsKey = (userId: string): string => `user:${userId}:sessions`;
 const ttlSeconds = (): number => REFRESH_TOKEN_TTL_MS / 1000;
 
@@ -188,14 +198,15 @@ export const getSessionByHash = async (
 };
 
 /**
- * Token recien rotado, recuperable durante REFRESH_ROTATION_GRACE_SECONDS.
- * `jti` se guarda junto para poder reenviar el par cookie completo identico
- * al que emitio la rotacion original.
+ * Sucesor de un token rotado. `jti` se guarda junto para poder reenviar el
+ * par cookie completo identico al que emitio la rotacion original, y
+ * `rotatedAt` (ms) para medir la ventana de gracia.
  */
 export interface GraceSession {
 	userId: string;
 	token: string;
 	jti: string;
+	rotatedAt: number;
 }
 
 export const getGraceSession = async (
@@ -213,7 +224,14 @@ export const getGraceSession = async (
 		) {
 			return null;
 		}
-		return { userId: parsed.userId, token: parsed.token, jti: parsed.jti };
+		return {
+			userId: parsed.userId,
+			token: parsed.token,
+			jti: parsed.jti,
+			// Punteros escritos antes de existir el campo: sin fecha no hay
+			// ventana, solo vale la regla del sucesor vivo.
+			rotatedAt: typeof parsed.rotatedAt === "number" ? parsed.rotatedAt : 0,
+		};
 	} catch {
 		return null;
 	}
@@ -222,21 +240,29 @@ export const getGraceSession = async (
 /**
  * Decide si un token muerto todavia puede rescatarse por gracia.
  *
- * Devuelve el token vigente de la familia solo si:
- *   - el puntero de gracia del hash presentado existe (fue rotado hace poco),
- *   - le pertenece al mismo usuario que dice el JWT presentado,
- *   - y la sesion vigente (el token del puntero) sigue viva en Redis.
+ * Devuelve el token vigente de la familia solo si el puntero de gracia del
+ * hash presentado existe, le pertenece al mismo usuario que dice el JWT
+ * presentado, y ademas se cumple UNA de estas dos:
  *
- * Ese ultimo chequeo es el que impide que un replay reviva una familia
- * revocada por logout o por un nuke de reuse detection: la sesion muerta no
- * se puede reabrir con una cookie vieja.
+ *   1. Padre del token activo: el sucesor directo sigue vivo, o sea nunca se
+ *      uso. Vale SIN limite de tiempo (dentro del `exp` del JWT). Es el caso
+ *      del cliente que perdio la respuesta de la rotacion (F5 con la request
+ *      en vuelo) y cuyos reintentos no llegaron al back (429 de Cloudflare):
+ *      cuando vuelve, minutos despues, sigue con el token viejo. Nadie mas uso
+ *      el sucesor, asi que no hay evidencia de robo, y entregarlo es el mismo
+ *      riesgo que ya implica tener el padre. Es la regla que usa GoTrue
+ *      (Supabase) para lo mismo.
+ *   2. Dentro de REFRESH_ROTATION_GRACE_SECONDS desde la rotacion del token
+ *      presentado: si el sucesor ya fue rotado a su vez (T1 -> T2 -> T3 en
+ *      pocos segundos, F5 seguidos donde alguna respuesta si llego), se sigue
+ *      la cadena de punteros hasta el token vivo.
  *
- * Si el token del puntero ya fue rotado a su vez (T1 -> T2 -> T3 en pocos
- * segundos: F5 seguidos donde alguna respuesta si llego), se sigue la cadena
- * de punteros hasta el token vivo. Sin esto, una request tardia con T1 caeria
- * en el nuke aunque el cliente sea el legitimo. Cada puntero vence a los
- * REFRESH_ROTATION_GRACE_SECONDS de SU rotacion, asi que la cadena no estira
- * la vida del token presentado: T1 sigue sirviendo solo esa ventana.
+ * Fuera de eso (token viejo cuyo sucesor ya se uso, pasada la ventana) es
+ * reuse real y quien llama nukea.
+ *
+ * El chequeo de que el token final siga vivo en Redis es el que impide que un
+ * replay reviva una familia revocada por logout o por un nuke de reuse
+ * detection: la sesion muerta no se puede reabrir con una cookie vieja.
  */
 const MAX_GRACE_HOPS = 10;
 
@@ -248,6 +274,7 @@ export const resolveGraceReplay = async ({
 	decodedId?: string;
 }): Promise<GraceSession | null> => {
 	let hash = previousHash;
+	let withinWindow = true;
 
 	for (let hop = 0; hop < MAX_GRACE_HOPS; hop++) {
 		const grace = await getGraceSession(hash);
@@ -258,6 +285,15 @@ export const resolveGraceReplay = async ({
 		const alive = await getSessionByHash(nextHash);
 		if (alive === grace.userId) return grace;
 		if (alive !== null) return null;
+
+		// El sucesor ya se uso: seguir la cadena solo si el token PRESENTADO
+		// se roto hace menos que la ventana. Los saltos siguientes son
+		// rotaciones posteriores, asi que no vuelven a medirse.
+		if (hop === 0) {
+			withinWindow =
+				Date.now() - grace.rotatedAt <= REFRESH_ROTATION_GRACE_SECONDS * 1000;
+		}
+		if (!withinWindow) return null;
 
 		hash = nextHash;
 	}
@@ -357,6 +393,11 @@ export const createSession = async ({
  * En el MISMO script se escribe el puntero de gracia `rt:grace:{previousHash}`
  * con el token nuevo: asi el DEL del viejo y el puntero que permite rescatar
  * a un cliente que perdio ese Set-Cookie son indivisibles.
+ *
+ * El puntero nuevo vive lo mismo que la sesion (la regla "padre del token
+ * activo" no tiene plazo), y la misma rotacion recorta el puntero del abuelo
+ * (`rt:parent:{previousHash}`) a la ventana corta: ese abuelo ya no es padre
+ * de nadie vivo y solo le queda la gracia de la cadena.
  */
 export const rotateSession = async ({
 	userId,
@@ -377,6 +418,7 @@ export const rotateSession = async ({
 		userId,
 		token: nextToken,
 		jti: nextJti,
+		rotatedAt: Date.now(),
 	});
 
 	const result = await redis.eval(
@@ -387,16 +429,25 @@ export const rotateSession = async ({
 			redis.call("ZREM", KEYS[3], ARGV[3])
 			redis.call("ZADD", KEYS[3], ARGV[4], ARGV[5])
 			redis.call("EXPIRE", KEYS[3], ARGV[2])
-			redis.call("SET", KEYS[4], ARGV[6], "EX", ARGV[7])
+			redis.call("SET", KEYS[4], ARGV[6], "EX", ARGV[2])
+
+			local grandparent = redis.call("GET", KEYS[5])
+			if grandparent then
+				redis.call("EXPIRE", ARGV[8] .. grandparent, ARGV[7])
+				redis.call("DEL", KEYS[5])
+			end
+			redis.call("SET", KEYS[6], ARGV[3], "EX", ARGV[2])
 			return 1
 		end
 		return 0
 		`,
-		4,
+		6,
 		rtKey(previousHash),
 		rtKey(nextHash),
 		userSessionsKey(userId),
 		graceKey(previousHash),
+		parentKey(previousHash),
+		parentKey(nextHash),
 		userId,
 		String(ttlSeconds()),
 		previousHash,
@@ -404,6 +455,7 @@ export const rotateSession = async ({
 		nextHash,
 		gracePayload,
 		String(REFRESH_ROTATION_GRACE_SECONDS),
+		graceKey(""),
 	);
 
 	return result === 1;
@@ -418,6 +470,7 @@ export const deleteSessionByHash = async (
 		.multi()
 		.del(rtKey(tokenHash))
 		.del(graceKey(tokenHash))
+		.del(parentKey(tokenHash))
 		.zrem(userSessionsKey(userId), tokenHash)
 		.exec();
 };
@@ -437,6 +490,7 @@ export const deleteAllSessions = async (userId: string): Promise<void> => {
 	for (const hash of tokenHashes) {
 		pipeline.del(rtKey(hash));
 		pipeline.del(graceKey(hash));
+		pipeline.del(parentKey(hash));
 	}
 	pipeline.del(key);
 	await pipeline.exec();
