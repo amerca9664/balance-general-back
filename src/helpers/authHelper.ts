@@ -47,6 +47,18 @@ export const REFRESH_TOKEN_TTL_MS =
 	REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000;
 const MAX_SESSIONS_PER_USER = readPositiveIntEnv("MAX_SESSIONS_PER_USER", 5);
 
+// Ventana de gracia posterior a cada rotacion.
+//
+// El Set-Cookie de la rotacion puede perderse si el cliente navega (F5) con
+// la request en vuelo: Redis queda con el token nuevo y la cookie con el
+// viejo. Sin gracia, ese cliente "reutiliza" su propio token en el proximo
+// refresh y la reuse detection lo nukea. Dentro de este plazo se responde con
+// el token vigente en vez de castigar; fuera del plazo, reuse real.
+const REFRESH_ROTATION_GRACE_SECONDS = readPositiveIntEnv(
+	"REFRESH_ROTATION_GRACE_SECONDS",
+	60,
+);
+
 // bcrypt solo acepta 4..31 rounds: por debajo es debil, por encima lanza y
 // rompe /register con un 500. El clamp evita que una env var mal escrita
 // tire el registro de usuarios.
@@ -56,6 +68,11 @@ export const SALT_ROUNDS = Math.min(
 );
 
 const rtKey = (tokenHash: string): string => `rt:${tokenHash}`;
+// Puntero de gracia: escrito en la MISMA escritura atomica que borra el token
+// viejo, asi que `rt:{hash} == null` implica `rt:grace:{hash} != null` (salvo
+// que la gracia ya venciera). No hay ventana en la que el token este muerto
+// y el puntero no exista.
+const graceKey = (tokenHash: string): string => `rt:grace:${tokenHash}`;
 const userSessionsKey = (userId: string): string => `user:${userId}:sessions`;
 const ttlSeconds = (): number => REFRESH_TOKEN_TTL_MS / 1000;
 
@@ -140,7 +157,11 @@ export const setjti = (res: Response, jti: string): void => {
 };
 
 export const clearRefreshCookie = (res: Response): void => {
+	// Los DOS cookies de la sesion: si solo se limpia `jwt`, el `jti` huérfano
+	// sobrevive al logout y el proximo refresh arranca con un jti que ya estuvo
+	// en circulacion.
 	res.clearCookie("jwt", COOKIE_OPTIONS);
+	res.clearCookie("jti", COOKIE_OPTIONS);
 };
 
 // ---------------------------------------------------------------------------
@@ -164,6 +185,84 @@ export const getSessionByHash = async (
 ): Promise<string | null> => {
 	const redis = getRedisClient();
 	return redis.get(rtKey(tokenHash));
+};
+
+/**
+ * Token recien rotado, recuperable durante REFRESH_ROTATION_GRACE_SECONDS.
+ * `jti` se guarda junto para poder reenviar el par cookie completo identico
+ * al que emitio la rotacion original.
+ */
+export interface GraceSession {
+	userId: string;
+	token: string;
+	jti: string;
+}
+
+export const getGraceSession = async (
+	tokenHash: string,
+): Promise<GraceSession | null> => {
+	const raw = await getRedisClient().get(graceKey(tokenHash));
+	if (!raw) return null;
+
+	try {
+		const parsed = JSON.parse(raw) as Partial<GraceSession>;
+		if (
+			typeof parsed.userId !== "string" ||
+			typeof parsed.token !== "string" ||
+			typeof parsed.jti !== "string"
+		) {
+			return null;
+		}
+		return { userId: parsed.userId, token: parsed.token, jti: parsed.jti };
+	} catch {
+		return null;
+	}
+};
+
+/**
+ * Decide si un token muerto todavia puede rescatarse por gracia.
+ *
+ * Devuelve el token vigente de la familia solo si:
+ *   - el puntero de gracia del hash presentado existe (fue rotado hace poco),
+ *   - le pertenece al mismo usuario que dice el JWT presentado,
+ *   - y la sesion vigente (el token del puntero) sigue viva en Redis.
+ *
+ * Ese ultimo chequeo es el que impide que un replay reviva una familia
+ * revocada por logout o por un nuke de reuse detection: la sesion muerta no
+ * se puede reabrir con una cookie vieja.
+ *
+ * Si el token del puntero ya fue rotado a su vez (T1 -> T2 -> T3 en pocos
+ * segundos: F5 seguidos donde alguna respuesta si llego), se sigue la cadena
+ * de punteros hasta el token vivo. Sin esto, una request tardia con T1 caeria
+ * en el nuke aunque el cliente sea el legitimo. Cada puntero vence a los
+ * REFRESH_ROTATION_GRACE_SECONDS de SU rotacion, asi que la cadena no estira
+ * la vida del token presentado: T1 sigue sirviendo solo esa ventana.
+ */
+const MAX_GRACE_HOPS = 10;
+
+export const resolveGraceReplay = async ({
+	previousHash,
+	decodedId,
+}: {
+	previousHash: string;
+	decodedId?: string;
+}): Promise<GraceSession | null> => {
+	let hash = previousHash;
+
+	for (let hop = 0; hop < MAX_GRACE_HOPS; hop++) {
+		const grace = await getGraceSession(hash);
+		if (!grace) return null;
+		if (decodedId !== undefined && grace.userId !== decodedId) return null;
+
+		const nextHash = hashRefreshToken(grace.token);
+		const alive = await getSessionByHash(nextHash);
+		if (alive === grace.userId) return grace;
+		if (alive !== null) return null;
+
+		hash = nextHash;
+	}
+
+	return null;
 };
 
 /**
@@ -254,17 +353,31 @@ export const createSession = async ({
  *
  * El token realmente robado nunca llega aca: falla antes, en
  * `getSessionByHash`, que es donde vive la deteccion de robo.
+ *
+ * En el MISMO script se escribe el puntero de gracia `rt:grace:{previousHash}`
+ * con el token nuevo: asi el DEL del viejo y el puntero que permite rescatar
+ * a un cliente que perdio ese Set-Cookie son indivisibles.
  */
 export const rotateSession = async ({
 	userId,
 	previousHash,
 	nextHash,
+	nextToken,
+	nextJti,
 }: {
 	userId: string;
 	previousHash: string;
 	nextHash: string;
+	nextToken: string;
+	nextJti: string;
 }): Promise<boolean> => {
 	const redis = getRedisClient();
+
+	const gracePayload = JSON.stringify({
+		userId,
+		token: nextToken,
+		jti: nextJti,
+	});
 
 	const result = await redis.eval(
 		`
@@ -274,19 +387,23 @@ export const rotateSession = async ({
 			redis.call("ZREM", KEYS[3], ARGV[3])
 			redis.call("ZADD", KEYS[3], ARGV[4], ARGV[5])
 			redis.call("EXPIRE", KEYS[3], ARGV[2])
+			redis.call("SET", KEYS[4], ARGV[6], "EX", ARGV[7])
 			return 1
 		end
 		return 0
 		`,
-		3,
+		4,
 		rtKey(previousHash),
 		rtKey(nextHash),
 		userSessionsKey(userId),
+		graceKey(previousHash),
 		userId,
 		String(ttlSeconds()),
 		previousHash,
 		String(Date.now() + REFRESH_TOKEN_TTL_MS),
 		nextHash,
+		gracePayload,
+		String(REFRESH_ROTATION_GRACE_SECONDS),
 	);
 
 	return result === 1;
@@ -300,6 +417,7 @@ export const deleteSessionByHash = async (
 	await redis
 		.multi()
 		.del(rtKey(tokenHash))
+		.del(graceKey(tokenHash))
 		.zrem(userSessionsKey(userId), tokenHash)
 		.exec();
 };
@@ -318,6 +436,7 @@ export const deleteAllSessions = async (userId: string): Promise<void> => {
 	const pipeline = redis.multi();
 	for (const hash of tokenHashes) {
 		pipeline.del(rtKey(hash));
+		pipeline.del(graceKey(hash));
 	}
 	pipeline.del(key);
 	await pipeline.exec();
@@ -397,34 +516,4 @@ export const existingLoginTokenReuseLogic = async (
 	// console.log(
 	// 	`🔒 Todas las sesiones invalidadas para: ${prior.username ?? prior.id}.`,
 	// );
-};
-
-export const registerJti = async ({
-	jti,
-	tokenHash,
-}: {
-	jti: string;
-	tokenHash: string;
-}): Promise<boolean> => {
-	const redis = getRedisClient();
-
-	const result = await redis.eval(
-		`
-		local existing = redis.call("GET", KEYS[1])
-
-		if existing then
-			return 0
-		end
-
-		redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
-
-		return 1
-		`,
-		1,
-		`refresh:jti:${jti}`,
-		tokenHash,
-		String(5),
-	);
-
-	return result === 1;
 };

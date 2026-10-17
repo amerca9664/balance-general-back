@@ -6,10 +6,11 @@ import {
 	deleteAllSessions,
 	deleteSessionByHash,
 	existingLoginTokenReuseLogic,
+	type GraceSession,
 	getSessionByHash,
-	handlePossibleReuse,
 	hashRefreshToken,
-	registerJti,
+	type RefreshTokenPayload,
+	resolveGraceReplay,
 	rotateSession,
 	SALT_ROUNDS,
 	setjti,
@@ -106,6 +107,29 @@ export const registerController = async (req: Request, res: Response) => {
 	}
 };
 
+/**
+ * Replay dentro de la ventana de gracia: reenvia el par de cookies vigente
+ * (el mismo que emitio la rotacion original) y un access token nuevo.
+ *
+ * Es idempotente: no rota ni cambia nada en Redis, asi que dos requests que
+ * rescaten al mismo cliente desfasado reciben exactamente el mismo token y
+ * el cookie jar termina consistente sin importar el orden en que lleguen.
+ */
+const replyWithGraceSession = (
+	res: Response,
+	grace: GraceSession,
+	decoded: RefreshTokenPayload,
+) => {
+	setRefreshCookie(res, grace.token);
+	setjti(res, grace.jti);
+
+	const accessToken = signAccessToken(decoded.id, decoded.username);
+
+	return res
+		.status(200)
+		.json({ success: true, message: "ok", token: accessToken });
+};
+
 export const handleRefreshToken = async (req: Request, res: Response) => {
 	try {
 		const cookieRefreshToken = req.cookies?.jwt;
@@ -115,34 +139,13 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 				.json({ success: false, message: "Falta refresh token" });
 		}
 
-		const cookieJti = req.cookies?.jti;
 		const previousHash = hashRefreshToken(cookieRefreshToken);
 
-		const registered = await registerJti({
-			jti: cookieJti,
-			tokenHash: previousHash,
-		});
-
-		if (!registered) {
-			// El jti ya existe.
-			// No volver a rotar el refresh token.
-			return res
-				.status(409)
-				.json({ success: false, message: "Refresh token ya usado" });
-		}
-
-		// Uncondicional, como en el original: garantiza que ninguna salida de esta
-		// funcion deje viva una cookie vieja, incluidas las de error y el 500.
-		// Pasa por clearRefreshCookie y no por un literal: el `path` tiene que ser
-		// identico al del setRefreshCookie() del final (los dos comparten
-		// COOKIE_OPTIONS adentro del helper); si divergen, el clear no borra nada y
-		// el token sigue viajando en cada request sin que se note.
-		clearRefreshCookie(res);
-
-		// Si la firma no verifica, no hay a quien atribuirle el token y no se
-		// toca Redis.
+		// Firma primero: sin un payload verificado no hay a quien atribuirle el
+		// token, y un token basura tampoco tiene por que quemar un jti.
 		const decoded = verifyRefreshToken(cookieRefreshToken);
 		if (!decoded?.id) {
+			clearRefreshCookie(res);
 			return res
 				.status(403)
 				.json({ success: false, message: "Refresh token inválido" });
@@ -150,32 +153,65 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 
 		const sessionUserId = await getSessionByHash(previousHash);
 
-		// El JWT verifica pero ese hash no esta en Redis: o nunca lo emitimos,
-		// o ya fue rotado. Con Redis esto NO es el vencimiento normal, porque el
-		// `EX` de la clave y el `exp` del JWT se fijaron en el mismo momento:
-		// si el JWT esta vivo, la clave tambien. Huele a replay => nuke.
+		if (sessionUserId && sessionUserId !== decoded.id) {
+			// La sesion dice pertenecer a otro usuario que el token firmado.
+			// Misma politica que la reuse: se revocan todos los tokens del
+			// dueno del token presentado.
+			console.log("🚨 ¡Refresh token de otro usuario detectado!");
+			await deleteAllSessions(decoded.id);
+			clearRefreshCookie(res);
+			return res
+				.status(403)
+				.json({ success: false, message: "Refresh token manipulado" });
+		}
+
 		if (!sessionUserId) {
-			// await handlePossibleReuse(cookieRefreshToken);
+			// El JWT verifica pero ese hash ya no esta activo: o nunca lo
+			// emitimos, o ya fue rotado.
+			//
+			// Primero la gracia: si la rotacion fue hace segundos, lo mas
+			// probable es el propio cliente cuyo Set-Cookie se perdio (F5 con
+			// la request en vuelo), no un robo. Se le devuelve el token
+			// vigente y listo.
+			const grace = await resolveGraceReplay({
+				previousHash,
+				decodedId: decoded.id,
+			});
+			if (grace) {
+				console.log("Gracia: cliente resincronizado con el token vigente.");
+				return replyWithGraceSession(res, grace, decoded);
+			}
+
+			// Con Redis esto NO es el vencimiento normal, porque el `EX` de la
+			// clave y el `exp` del JWT se fijaron en el mismo momento: si el
+			// JWT esta vivo, la clave tambien. Huele a replay => nuke.
 			console.log("🚨 ¡Intento de reutilización de Refresh Token detectado!");
 			await deleteAllSessions(decoded.id);
 			console.log(
 				`🔒 Todas las sesiones invalidadas para: ${decoded.username ?? decoded.id}.`,
 			);
+			clearRefreshCookie(res);
 			return res
 				.status(403)
 				.json({ success: false, message: "Refresh token inválido" });
 		}
 
-		if (sessionUserId !== decoded.id) {
-			// La sesion dice pertenecer a otro usuario que el token firmado.
-			// Misma politica que el reuse: se revocan todos los tokens del
-			// dueno del token presentado.
-			console.log("🚨 ¡Refresh token de otro usuario detectado!");
-			await deleteAllSessions(decoded.id);
-			return res
-				.status(403)
-				.json({ success: false, message: "Refresh token manipulado" });
-		}
+		// La sesion esta activa y es del dueño del token: rotacion en curso.
+		//
+		// Sin dedup previo por jti: el CAS de rotateSession ya garantiza que de
+		// N requests concurrentes con el mismo token solo una rote, y como el
+		// puntero de gracia se escribe en el MISMO script que borra el token
+		// viejo, las perdedoras siempre lo encuentran y reciben el token
+		// vigente (200). Un dedup aparte respondia 409 ANTES de que existiera
+		// la gracia, y el front se quedaba sin access token.
+
+		// Si la rotacion no llega a completarse, ninguna salida posterior deja
+		// viva la cookie vieja (incluidas las de error y el 500): pasa por
+		// clearRefreshCookie y no por un literal, porque el `path` tiene que
+		// ser identico al del setRefreshCookie() del final (los dos comparten
+		// COOKIE_OPTIONS adentro del helper); si divergen, el clear no borra
+		// nada y el token sigue viajando en cada request sin que se note.
+		clearRefreshCookie(res);
 
 		const accessToken = signAccessToken(decoded.id, decoded.username);
 
@@ -194,6 +230,8 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 			userId: decoded.id,
 			previousHash,
 			nextHash,
+			nextToken: nextRefreshToken,
+			nextJti: newJti,
 		});
 
 		if (!rotated) {
@@ -204,9 +242,17 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 			// Nuke-all aca te desloguearia de todos tus dispositivos por una
 			// carrera propia.
 			//
-			// Un token realmente robado nunca llega aca: fallaria antes, en
-			// getSessionByHash, que es donde vive la deteccion de robo.
-			//
+			// Ese ganador dejo ademas el puntero de gracia con su token, asi
+			// que lo mas probable es poder resincronizar al cliente aca mismo.
+			const grace = await resolveGraceReplay({
+				previousHash,
+				decodedId: decoded.id,
+			});
+			if (grace) {
+				console.log("Rotación perdida: resincronizado con el token vigente.");
+				return replyWithGraceSession(res, grace, decoded);
+			}
+
 			// Tampoco se vuelve a setear la cookie: la respuesta perdedora puede
 			// llegar DESPUES de la ganadora, y su Set-Cookie pisaria el token
 			// bueno que acaba de emitir el ganador.
@@ -242,6 +288,17 @@ export const logoutController = async (req: Request, res: Response) => {
 			const userId = await getSessionByHash(tokenHash);
 			if (userId) {
 				await deleteSessionByHash(userId, tokenHash);
+			} else {
+				// Cookie desfasada (se perdio el Set-Cookie de la ultima
+				// rotacion): igual hay que cortar la sesion vigente a la que
+				// apunta el puntero de gracia, o el logout no revocaria nada.
+				const grace = await resolveGraceReplay({ previousHash: tokenHash });
+				if (grace) {
+					await deleteSessionByHash(
+						grace.userId,
+						hashRefreshToken(grace.token),
+					);
+				}
 			}
 		}
 
