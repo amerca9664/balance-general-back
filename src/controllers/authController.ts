@@ -5,6 +5,7 @@ import {
 	createSession,
 	deleteSession,
 	generateSessionToken,
+	getRequestMeta,
 	hashSessionToken,
 	SALT_ROUNDS,
 	setSessionCookie,
@@ -43,6 +44,7 @@ export const loginController = async (req: Request, res: Response) => {
 			userId: String(user._id),
 			username: user.email,
 			tokenHash: hashSessionToken(sessionToken),
+			meta: getRequestMeta(req),
 		});
 
 		setSessionCookie(res, sessionToken);
@@ -109,7 +111,10 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 				.json({ success: false, message: "Falta refresh token" });
 		}
 
-		const session = await touchSession(hashSessionToken(cookieSessionToken));
+		const session = await touchSession(
+			hashSessionToken(cookieSessionToken),
+			getRequestMeta(req),
+		);
 		if (!session) {
 			clearSessionCookie(res);
 			return res

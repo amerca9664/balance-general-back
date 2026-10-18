@@ -1,5 +1,5 @@
-import { createHash, randomBytes } from "node:crypto";
-import type { CookieOptions, Response } from "express";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import type { CookieOptions, Request, Response } from "express";
 import jwt from "jsonwebtoken";
 import { getRedisClient } from "../dbs/redis.js";
 
@@ -11,7 +11,7 @@ const IS_PRODUCTION = process.env.NODE_ENV === "production";
 const COOKIE_OPTIONS: CookieOptions = {
 	httpOnly: true,
 	secure: IS_PRODUCTION,
-	sameSite: IS_PRODUCTION ? "none" : "lax",
+	sameSite: IS_PRODUCTION ? "strict" : "lax",
 	// Scoped al router de auth: no viaja en cada llamada a la API.
 	path: "/api/auth",
 };
@@ -115,11 +115,48 @@ export const clearSessionCookie = (res: Response): void => {
 // ---------------------------------------------------------------------------
 // Session store (Redis, unica fuente de verdad)
 //
-//   session:{sha256(token)} HASH  userId, username, createdAt   TTL = inactividad
+//   session:{sha256(token)} HASH  userId, username, createdAt, id,
+//                                 userAgent, ip, country,
+//                                 lastSeenAt, lastIp, lastCountry   TTL = inactividad
 //   user:{userId}:sessions  ZSET  member = tokenHash   score = timestamp de expiracion
 //
 // El token se guarda hasheado: quien lea Redis no puede usar las sesiones.
+//
+// `id` es el identificador PUBLICO de la sesion (para listarla o cerrarla
+// desde el front): nunca se expone el hash del token. Los metadatos de origen
+// (userAgent/ip/country) son del login; los `last*` se actualizan en cada
+// refresh. Viven lo mismo que la sesion: la IP es dato personal y no se
+// guarda mas alla de eso.
 // ---------------------------------------------------------------------------
+
+/** De donde viene una request: lo que se anota en la sesion. */
+export interface RequestMeta {
+	userAgent: string;
+	ip: string;
+	country: string;
+}
+
+// Un User-Agent puede medir lo que el cliente quiera: se recorta para que no
+// infle Redis.
+const MAX_USER_AGENT_LENGTH = 512;
+
+/**
+ * Extrae user-agent, IP y pais de la request.
+ *
+ * `CF-Connecting-IP` y `CF-IPCountry` los agrega Cloudflare (tambien en el
+ * plan gratuito; el pais requiere activar IP Geolocation en Network). Solo son
+ * confiables si al origen no se puede llegar sin pasar por Cloudflare: si se
+ * puede, cualquiera los inventa. Sin Cloudflare (local) cae a la IP del
+ * socket y el pais queda vacio.
+ */
+export const getRequestMeta = (req: Request): RequestMeta => {
+	const cfIp = req.get("cf-connecting-ip");
+	return {
+		userAgent: (req.get("user-agent") ?? "").slice(0, MAX_USER_AGENT_LENGTH),
+		ip: cfIp ?? req.socket.remoteAddress ?? "",
+		country: req.get("cf-ipcountry") ?? "",
+	};
+};
 
 /**
  * Crea la sesion y la anota en el indice del usuario, en UNA sola llamada
@@ -130,10 +167,12 @@ export const createSession = async ({
 	userId,
 	username,
 	tokenHash,
+	meta,
 }: {
 	userId: string;
 	username: string;
 	tokenHash: string;
+	meta: RequestMeta;
 }): Promise<void> => {
 	const redis = getRedisClient();
 	const now = Date.now();
@@ -141,7 +180,9 @@ export const createSession = async ({
 	await redis.eval(
 		`
 		redis.call("HSET", KEYS[1], "userId", ARGV[1], "username", ARGV[2],
-			"createdAt", ARGV[3])
+			"createdAt", ARGV[3], "id", ARGV[9], "userAgent", ARGV[10], "ip", ARGV[11],
+			"country", ARGV[12], "lastSeenAt", ARGV[3], "lastIp", ARGV[11],
+			"lastCountry", ARGV[12])
 		redis.call("EXPIRE", KEYS[1], ARGV[4])
 		redis.call("ZADD", KEYS[2], ARGV[5], ARGV[6])
 
@@ -175,6 +216,10 @@ export const createSession = async ({
 		tokenHash,
 		MAX_SESSIONS_PER_USER,
 		sessionKey(""),
+		randomUUID(),
+		meta.userAgent,
+		meta.ip,
+		meta.country,
 	);
 
 	console.log(`Sesión creada para el usuario: ${userId}`);
@@ -187,13 +232,15 @@ export interface Session {
 
 /**
  * Busca la sesion del token y, si sigue valida, extiende su vencimiento por
- * inactividad (sliding expiration). Pasada la vida maxima absoluta la borra.
+ * inactividad (sliding expiration) y anota desde donde se uso por ultima vez.
+ * Pasada la vida maxima absoluta la borra.
  * Todo en un solo script: dos refresh concurrentes ven lo mismo.
  *
  * `null` = no hay sesion: nunca existio, vencio, se cerro o llego al tope.
  */
 export const touchSession = async (
 	tokenHash: string,
+	meta: RequestMeta,
 ): Promise<Session | null> => {
 	const redis = getRedisClient();
 	const now = Date.now();
@@ -212,6 +259,8 @@ export const touchSession = async (
 			return nil
 		end
 
+		redis.call("HSET", KEYS[1], "lastSeenAt", ARGV[1], "lastIp", ARGV[7],
+			"lastCountry", ARGV[8])
 		redis.call("EXPIRE", KEYS[1], ARGV[3])
 		redis.call("ZADD", index, ARGV[4], ARGV[6])
 		redis.call("EXPIRE", index, ARGV[3])
@@ -225,6 +274,8 @@ export const touchSession = async (
 		String(now + REFRESH_TOKEN_TTL_MS),
 		"user:",
 		tokenHash,
+		meta.ip,
+		meta.country,
 	)) as [string, string] | null;
 
 	if (!result) return null;
