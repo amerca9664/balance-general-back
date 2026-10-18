@@ -12,11 +12,31 @@ import {
 	signAccessToken,
 	touchSession,
 } from "../helpers/authHelper.js";
+import {
+	releaseIdempotencyKey,
+	storeIdempotencyKey,
+} from "../helpers/idempotencyHelper.js";
 import { User } from "../models/users.js";
 
 export const loginController = async (req: Request, res: Response) => {
+	const { email, password, idempotencyKey } = req.body;
+	// La key se reserva ANTES de cualquier busqueda, asi un duplicado corta sin
+	// tocar Mongo ni bcrypt. Todavia no hay userId: el dueño es el email
+	// normalizado. Un duplicado siempre recibe 409.
+	const owner = String(email).trim().toLowerCase();
+	// true solo si esta request reservo la key: en el catch se libera para que
+	// el cliente pueda reintentar con la misma key.
+	let reserved = false;
+
 	try {
-		const { email, password } = req.body;
+		if (!(await storeIdempotencyKey(owner, idempotencyKey))) {
+			return res.status(409).json({
+				success: false,
+				message: "Solicitud duplicada: idempotency key ya utilizada",
+			});
+		}
+		reserved = true;
+
 		const cookieSessionToken = req.cookies?.jwt;
 
 		const user = await User.findOne({ email });
@@ -57,6 +77,9 @@ export const loginController = async (req: Request, res: Response) => {
 		});
 	} catch (_error) {
 		console.error(_error);
+		if (reserved) {
+			await releaseIdempotencyKey(owner, idempotencyKey).catch(console.error);
+		}
 		return res
 			.status(500)
 			.json({ success: false, message: "Error interno del servidor" });

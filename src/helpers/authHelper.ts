@@ -26,7 +26,7 @@ const COOKIE_OPTIONS: CookieOptions = {
  * las sesiones en cada login. Un valor presente pero inutilizable tiene que
  * caer al default, no colarse.
  */
-const readPositiveIntEnv = (name: string, fallback: number): number => {
+export const readPositiveIntEnv = (name: string, fallback: number): number => {
 	const raw = process.env[name];
 	if (!raw) return fallback;
 	const parsed = Number.parseInt(raw.trim(), 10);
