@@ -1,27 +1,22 @@
-import { randomUUID } from "node:crypto";
 import bcrypt from "bcrypt";
 import type { Request, Response } from "express";
 import {
-	clearRefreshCookie,
-	closePreviousSession,
+	clearSessionCookie,
 	createSession,
 	deleteSession,
-	hashRefreshToken,
-	refreshSession,
+	generateSessionToken,
+	hashSessionToken,
 	SALT_ROUNDS,
-	setRefreshCookie,
+	setSessionCookie,
 	signAccessToken,
-	signRefreshToken,
-	verifyRefreshToken,
+	touchSession,
 } from "../helpers/authHelper.js";
 import { User } from "../models/users.js";
-
-const nowSeconds = (): number => Math.floor(Date.now() / 1000);
 
 export const loginController = async (req: Request, res: Response) => {
 	try {
 		const { email, password } = req.body;
-		const cookieRefreshToken = req.cookies?.jwt;
+		const cookieSessionToken = req.cookies?.jwt;
 
 		const user = await User.findOne({ email });
 		if (!user) {
@@ -37,39 +32,25 @@ export const loginController = async (req: Request, res: Response) => {
 				.json({ success: false, message: "Credenciales inválidas" });
 		}
 
-		if (cookieRefreshToken) {
-			await closePreviousSession(cookieRefreshToken);
-			clearRefreshCookie(res);
+		if (cookieSessionToken) {
+			// Login encima de una sesion previa del mismo navegador: se cierra
+			// para que no quede colgada. El resto de las sesiones queda intacto.
+			await deleteSession(hashSessionToken(cookieSessionToken));
 		}
 
-		const accessToken = signAccessToken(user._id, user.email);
-
-		// Una sesion nueva = una familia nueva de refresh tokens.
-		const sid = randomUUID();
-		const jti = randomUUID();
-		const iat = nowSeconds();
-		const newRefreshToken = signRefreshToken({
-			userId: String(user._id),
-			username: user.email,
-			sid,
-			jti,
-			iat,
-		});
-
+		const sessionToken = generateSessionToken();
 		await createSession({
 			userId: String(user._id),
-			sid,
-			tokenHash: hashRefreshToken(newRefreshToken),
-			jti,
-			iat,
+			username: user.email,
+			tokenHash: hashSessionToken(sessionToken),
 		});
 
-		setRefreshCookie(res, newRefreshToken);
+		setSessionCookie(res, sessionToken);
 
 		return res.status(200).json({
 			success: true,
 			message: "ok",
-			token: accessToken,
+			token: signAccessToken(user._id, user.email),
 			username: user.username,
 		});
 	} catch (_error) {
@@ -112,79 +93,36 @@ export const registerController = async (req: Request, res: Response) => {
 	}
 };
 
+/**
+ * Emite un access token nuevo a partir de la cookie de sesion.
+ *
+ * No rota el token de sesion: es idempotente, asi que refresh concurrentes o
+ * repetidos (F5, varias pestañas, reintentos tras un 429) nunca se pisan.
+ * Solo extiende el vencimiento por inactividad, en Redis y en la cookie.
+ */
 export const handleRefreshToken = async (req: Request, res: Response) => {
 	try {
-		const cookieRefreshToken = req.cookies?.jwt;
-		if (!cookieRefreshToken) {
+		const cookieSessionToken = req.cookies?.jwt;
+		if (!cookieSessionToken) {
 			return res
 				.status(401)
 				.json({ success: false, message: "Falta refresh token" });
 		}
 
-		// Si la firma no verifica, no hay a quien atribuirle el token y no se
-		// toca Redis. Los tokens sin `sid` son de antes de las sesiones por
-		// familia: se rechazan y el usuario vuelve a loguearse una vez.
-		const decoded = verifyRefreshToken(cookieRefreshToken);
-		if (!decoded?.id || !decoded.sid) {
-			clearRefreshCookie(res);
+		const session = await touchSession(hashSessionToken(cookieSessionToken));
+		if (!session) {
+			clearSessionCookie(res);
 			return res
 				.status(403)
 				.json({ success: false, message: "Refresh token inválido" });
 		}
 
-		const username = decoded.username ?? "";
-		const nextJti = randomUUID();
-		const nextIat = nowSeconds();
-		const nextRefreshToken = signRefreshToken({
-			userId: decoded.id,
-			username,
-			sid: decoded.sid,
-			jti: nextJti,
-			iat: nextIat,
-		});
-
-		const result = await refreshSession({
-			userId: decoded.id,
-			sid: decoded.sid,
-			tokenHash: hashRefreshToken(cookieRefreshToken),
-			nextHash: hashRefreshToken(nextRefreshToken),
-			nextJti,
-			nextIat,
-		});
-
-		if (result.status === "reuse-detected") {
-			// Token viejo fuera del reuse interval: la familia esta
-			// comprometida y ya se revoco esa sesion (solo esa).
-			console.log(
-				`🚨 Reuso de refresh token: sesión ${decoded.sid} revocada (${username || decoded.id}).`,
-			);
-		}
-
-		if (result.status === "reuse-detected" || result.status === "not-found") {
-			clearRefreshCookie(res);
-			return res
-				.status(403)
-				.json({ success: false, message: "Refresh token inválido" });
-		}
-
-		// Dentro del reuse interval se reenvia el token vigente, re-firmado
-		// con su jti/iat: es identico al que emitio la rotacion original.
-		const refreshTokenToSend =
-			result.status === "rotated"
-				? nextRefreshToken
-				: signRefreshToken({
-						userId: decoded.id,
-						username,
-						sid: decoded.sid,
-						jti: result.jti,
-						iat: result.iat,
-					});
-
-		setRefreshCookie(res, refreshTokenToSend);
+		// Mismo token, vencimiento renovado: la cookie acompaña al TTL de Redis.
+		setSessionCookie(res, cookieSessionToken);
 		return res.status(200).json({
 			success: true,
 			message: "ok",
-			token: signAccessToken(decoded.id, decoded.username),
+			token: signAccessToken(session.userId, session.username),
 		});
 	} catch (_error) {
 		console.error(_error);
@@ -196,15 +134,12 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 
 export const logoutController = async (req: Request, res: Response) => {
 	try {
-		const cookieRefreshToken = req.cookies?.jwt;
-		if (cookieRefreshToken) {
-			const decoded = verifyRefreshToken(cookieRefreshToken);
-			if (decoded?.id && decoded.sid) {
-				await deleteSession(decoded.id, decoded.sid);
-			}
+		const cookieSessionToken = req.cookies?.jwt;
+		if (cookieSessionToken) {
+			await deleteSession(hashSessionToken(cookieSessionToken));
 		}
 
-		clearRefreshCookie(res);
+		clearSessionCookie(res);
 
 		return res
 			.status(200)

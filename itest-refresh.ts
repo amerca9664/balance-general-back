@@ -1,18 +1,20 @@
-// Prueba end-to-end de /api/auth/refresh contra un Redis real.
+// Prueba end-to-end de /api/auth/refresh y /logout contra un Redis real.
 //
-//   REFRESH_REUSE_INTERVAL_SECONDS=2 tsx --env-file=.env itest-refresh.ts
+//   tsx --env-file=.env itest-refresh.ts
 //
-// Reproduce el bug de produccion: F5 repetidos mandan el mismo refresh token
-// varias veces (en paralelo o con el Set-Cookie de la respuesta perdido) y el
-// back lo tomaba como robo y borraba todas las sesiones.
-import { randomUUID } from "node:crypto";
+// Reproduce el bug de produccion: F5 repetidos mandan el mismo token varias
+// veces (en paralelo, con la respuesta perdida o tras un 429) y el back lo
+// tomaba como robo y cerraba la sesion. Con el token de sesion sin rotacion
+// todas esas requests son equivalentes.
 import cookieParser from "cookie-parser";
 import express from "express";
-import { handleRefreshToken } from "./src/controllers/authController.js";
+import {
+	handleRefreshToken,
+	logoutController,
+} from "./src/controllers/authController.js";
 import { connectRedis } from "./src/dbs/redis.js";
 import * as h from "./src/helpers/authHelper.js";
 
-const INTERVAL = Number(process.env.REFRESH_REUSE_INTERVAL_SECONDS ?? 30);
 const r = connectRedis();
 let failures = 0;
 
@@ -30,42 +32,37 @@ const check = (name: string, got: unknown, want: unknown) => {
 const app = express();
 app.use(cookieParser());
 app.post("/api/auth/refresh", handleRefreshToken);
+app.post("/api/auth/logout", logoutController);
 const server = app.listen(0);
 const port = (server.address() as { port: number }).port;
 
-/** Un refresh "del navegador": manda la cookie y devuelve el token nuevo, si vino. */
-const refresh = async (token: string) => {
-	const res = await fetch(`http://127.0.0.1:${port}/api/auth/refresh`, {
+/** Un POST "del navegador" con la cookie de sesion. */
+const post = async (path: string, token: string) => {
+	const res = await fetch(`http://127.0.0.1:${port}/api/auth/${path}`, {
 		method: "POST",
 		headers: { cookie: `jwt=${token}` },
 	});
-	const jwtCookie = res.headers
+	const body = (await res.json()) as { token?: string };
+	const cookie = res.headers
 		.getSetCookie()
 		.map((c) => c.split(";")[0])
-		.find((c) => c?.startsWith("jwt=") && c !== "jwt=");
-	return { status: res.status, next: jwtCookie?.slice(4) ?? null };
+		.find((c) => c?.startsWith("jwt="));
+	return {
+		status: res.status,
+		accessToken: body.token ?? null,
+		cookie: cookie?.slice(4) ?? null,
+	};
 };
 
-/** Simula un login: crea la sesion y devuelve su primer refresh token. */
+/** Simula un login: crea la sesion y devuelve su token. */
 const login = async (userId: string) => {
-	const sid = randomUUID();
-	const jti = randomUUID();
-	const iat = Math.floor(Date.now() / 1000);
-	const token = h.signRefreshToken({
-		userId,
-		username: "itest",
-		sid,
-		jti,
-		iat,
-	});
+	const token = h.generateSessionToken();
 	await h.createSession({
 		userId,
-		sid,
-		tokenHash: h.hashRefreshToken(token),
-		jti,
-		iat,
+		username: "itest",
+		tokenHash: h.hashSessionToken(token),
 	});
-	return { sid, token };
+	return token;
 };
 
 const uid = `itest-refresh-${Date.now()}`;
@@ -77,49 +74,35 @@ try {
 
 	console.log("--- 10 refresh concurrentes con el mismo token ---");
 	const burst = await Promise.all(
-		Array.from({ length: 10 }, () => refresh(a.token)),
+		Array.from({ length: 10 }, () => post("refresh", a)),
 	);
 	check(
-		"todas responden 200",
-		burst.every((x) => x.status === 200),
+		"todas responden 200 con access token",
+		burst.every((x) => x.status === 200 && x.accessToken),
 		true,
 	);
-	const t2 = burst[0]?.next as string;
 	check(
-		"todas reciben el MISMO token nuevo",
-		burst.every((x) => x.next === t2),
+		"la cookie no cambia (sin rotacion)",
+		burst.every((x) => x.cookie === a),
 		true,
 	);
-	check("el token nuevo es distinto del viejo", t2 !== a.token, true);
 
-	console.log("\n--- F5: el Set-Cookie se perdio, vuelve el token viejo ---");
-	const again = await refresh(a.token);
-	check(
-		"token viejo dentro del intervalo -> 200 con T2",
-		[again.status, again.next === t2],
-		[200, true],
-	);
+	console.log("\n--- respuesta perdida / 429: el mismo token, mas tarde ---");
+	await new Promise((ok) => setTimeout(ok, 3000));
+	check("el token sigue sirviendo", (await post("refresh", a)).status, 200);
 
-	console.log("\n--- el cliente sigue normal con T2 ---");
-	const step = await refresh(t2);
-	check("T2 rota normal", step.status, 200);
-	const t3 = step.next as string;
-
-	console.log(
-		`\n--- reuso real: token viejo pasado el intervalo (${INTERVAL}s) ---`,
-	);
-	await new Promise((ok) => setTimeout(ok, (INTERVAL + 1) * 1000));
-	check(
-		"T2 (previous) fuera del intervalo -> 403",
-		(await refresh(t2)).status,
-		403,
-	);
-	check("se revoco esa sesion", await r.exists(`session:${a.sid}`), 0);
-	check("T3 ya no refresca", (await refresh(t3)).status, 403);
+	console.log("\n--- logout ---");
+	check("logout -> 200", (await post("logout", a)).status, 200);
+	check("tras logout no refresca", (await post("refresh", a)).status, 403);
 	check(
 		"la otra sesion del usuario sigue viva",
-		(await refresh(b.token)).status,
+		(await post("refresh", b)).status,
 		200,
+	);
+	check(
+		"token inventado -> 403",
+		(await post("refresh", h.generateSessionToken())).status,
+		403,
 	);
 
 	console.log(
@@ -129,8 +112,8 @@ try {
 	failures++;
 	console.error(err);
 } finally {
-	for (const sid of await r.zrange(`user:${uid}:sessions`, 0, -1))
-		await r.del(`session:${sid}`);
+	for (const x of await r.zrange(`user:${uid}:sessions`, 0, -1))
+		await r.del(`session:${x}`);
 	await r.del(`user:${uid}:sessions`);
 	server.close();
 	r.disconnect();
