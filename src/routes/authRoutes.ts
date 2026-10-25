@@ -6,6 +6,7 @@ import {
 	meController,
 	registerController,
 } from "../controllers/authController.js";
+import { loginRateLimit } from "../middlewares/loginRateLimit.js";
 import { validate } from "../middlewares/validate.js";
 import { verifyToken } from "../middlewares/verifyToken.js";
 import { verifyTurnstile } from "../middlewares/verifyTurnstile.js";
@@ -17,6 +18,7 @@ authRouter.post(
 	"/login",
 	verifyTurnstile("login"),
 	validate(loginSchema),
+	loginRateLimit,
 	loginController,
 );
 authRouter.post(

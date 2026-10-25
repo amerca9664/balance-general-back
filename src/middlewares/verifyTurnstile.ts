@@ -1,4 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
+import { getRequestMeta } from "../helpers/authHelper.js";
 import { verifyTurnstileToken } from "../helpers/turnstileHelper.js";
 
 /**
@@ -23,7 +24,7 @@ export const verifyTurnstile =
 
 		const isValid = await verifyTurnstileToken({
 			token,
-			remoteip: req.ip,
+			remoteip: getRequestMeta(req).ip,
 			expectedAction: action,
 		});
 
