@@ -34,16 +34,21 @@ const tryConsume = async (
 	limiter: RateLimiterRedis,
 	key: string,
 	res: Response,
+	// El front lo usa para saber si cambiar de email desbloquea el boton.
+	scope: "ip" | "user_ip",
 ): Promise<boolean> => {
 	try {
 		await limiter.consume(key);
 		return true;
 	} catch (error) {
 		if (error instanceof RateLimiterRes) {
-			res.set("Retry-After", String(Math.ceil(error.msBeforeNext / 1000)));
+			const retryAfter = Math.ceil(error.msBeforeNext / 1000);
+			res.set("Retry-After", String(retryAfter));
 			res.status(429).json({
 				success: false,
 				message: "Demasiados intentos, intenta más tarde",
+				scope,
+				retryAfter,
 			});
 			return false;
 		}
@@ -67,7 +72,7 @@ export const loginIpRateLimit = async (
 	next: NextFunction,
 ): Promise<void> => {
 	const ip = getRequestMeta(req).ip || "unknown";
-	if (!(await tryConsume(byIp, ip, res))) return;
+	if (!(await tryConsume(byIp, ip, res, "ip"))) return;
 
 	res.on("finish", () => {
 		if (res.statusCode === 401 || res.statusCode === 429) return;
@@ -89,7 +94,7 @@ export const loginUserIpRateLimit = async (
 ): Promise<void> => {
 	const ip = getRequestMeta(req).ip || "unknown";
 	const key = `${String(req.body.email).trim().toLowerCase()}_${ip}`;
-	if (!(await tryConsume(byUserIp, key, res))) return;
+	if (!(await tryConsume(byUserIp, key, res, "user_ip"))) return;
 
 	res.on("finish", () => {
 		if (res.statusCode === 401) return;
