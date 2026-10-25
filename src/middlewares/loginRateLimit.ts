@@ -27,23 +27,17 @@ const byIp = new RateLimiterRedis({
 });
 
 /**
- * Rate limit de /login. Va despues de `validate(loginSchema)`: necesita el email.
- *
- * Cada intento consume ANTES de llegar al controller, asi muchos requests en
- * paralelo no pasan todos el chequeo. Al terminar la respuesta se devuelven los
- * puntos de todo lo que no fue 401 (exito, 409, 500): solo cuentan las
- * credenciales invalidas.
+ * Consume un punto ANTES de llegar al controller, asi muchos requests en
+ * paralelo no pasan todos el chequeo. Devuelve false si ya respondio (429/500).
  */
-export const loginRateLimit = async (
-	req: Request,
+const tryConsume = async (
+	limiter: RateLimiterRedis,
+	key: string,
 	res: Response,
-	next: NextFunction,
-): Promise<void> => {
-	const ip = getRequestMeta(req).ip || "unknown";
-	const userIpKey = `${String(req.body.email).trim().toLowerCase()}_${ip}`;
-
+): Promise<boolean> => {
 	try {
-		await Promise.all([byUserIp.consume(userIpKey), byIp.consume(ip)]);
+		await limiter.consume(key);
+		return true;
 	} catch (error) {
 		if (error instanceof RateLimiterRes) {
 			res.set("Retry-After", String(Math.ceil(error.msBeforeNext / 1000)));
@@ -51,22 +45,57 @@ export const loginRateLimit = async (
 				success: false,
 				message: "Demasiados intentos, intenta más tarde",
 			});
-			return;
+			return false;
 		}
 		console.error(error);
 		res
 			.status(500)
 			.json({ success: false, message: "Error interno del servidor" });
-		return;
+		return false;
 	}
+};
+
+/**
+ * Rate limit de /login por IP. Va ANTES de `loginUserIpRateLimit`: asi los
+ * reintentos de un email+IP ya bloqueado (429) tambien suman a la IP y no se
+ * puede insistir con el mismo usuario gratis. Se devuelve el punto de todo lo
+ * que no fue 401 ni 429 (exito, 409, 500).
+ */
+export const loginIpRateLimit = async (
+	req: Request,
+	res: Response,
+	next: NextFunction,
+): Promise<void> => {
+	const ip = getRequestMeta(req).ip || "unknown";
+	if (!(await tryConsume(byIp, ip, res))) return;
+
+	res.on("finish", () => {
+		if (res.statusCode === 401 || res.statusCode === 429) return;
+		byIp.reward(ip).catch(console.error);
+	});
+
+	next();
+};
+
+/**
+ * Rate limit de /login por email+IP. Va despues de `validate(loginSchema)`:
+ * necesita el email. Solo cuentan las credenciales invalidas (401); un login
+ * exitoso borra el contador y el resto (409, 500) devuelve el punto.
+ */
+export const loginUserIpRateLimit = async (
+	req: Request,
+	res: Response,
+	next: NextFunction,
+): Promise<void> => {
+	const ip = getRequestMeta(req).ip || "unknown";
+	const key = `${String(req.body.email).trim().toLowerCase()}_${ip}`;
+	if (!(await tryConsume(byUserIp, key, res))) return;
 
 	res.on("finish", () => {
 		if (res.statusCode === 401) return;
 		const restore =
-			res.statusCode === 200
-				? byUserIp.delete(userIpKey)
-				: byUserIp.reward(userIpKey);
-		Promise.all([restore, byIp.reward(ip)]).catch(console.error);
+			res.statusCode === 200 ? byUserIp.delete(key) : byUserIp.reward(key);
+		restore.catch(console.error);
 	});
 
 	next();
