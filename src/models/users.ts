@@ -16,9 +16,10 @@ const userSchema = new Schema({
 		type: String,
 		required: true,
 	},
-	isAdmin: {
-		type: Boolean,
-		default: false,
+	// Nombres de documentos de la coleccion Role.
+	roles: {
+		type: [String],
+		default: ["user"],
 	},
 	// Los refresh tokens viven en Redis (`rt:{sha256(token)}` con TTL).
 	// Un array aca no servia: no se podia auto-purgar, asi que los tokens

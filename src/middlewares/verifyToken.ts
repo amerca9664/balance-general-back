@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import jwt from "jsonwebtoken";
+import type { Permission } from "../models/roles.js";
 import {
 	accessTokenPayloadSchema,
 	bearerHeaderSchema,
@@ -73,11 +74,30 @@ export const verifyToken = (
 		});
 	}
 
-	const { id, username } = payloadParsed.data;
+	const { id, username, roles, permissions } = payloadParsed.data;
 	req.user = {
 		id,
 		username: username ?? "",
+		roles,
+		permissions,
 	};
 
 	return next();
 };
+
+/**
+ * Va despues de verifyToken: deja pasar solo si el usuario tiene TODOS los
+ * permisos. Lee el token, no Mongo: un cambio de permisos aplica en el
+ * proximo refresh.
+ */
+export const requirePermission =
+	(...required: Permission[]) =>
+	(req: Request, res: Response, next: NextFunction) => {
+		const granted = req.user?.permissions ?? [];
+		if (!required.every((permission) => granted.includes(permission))) {
+			return res
+				.status(403)
+				.json({ success: false, message: "Permisos insuficientes" });
+		}
+		return next();
+	};

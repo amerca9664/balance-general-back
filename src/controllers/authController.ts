@@ -16,6 +16,8 @@ import {
 	releaseIdempotencyKey,
 	storeIdempotencyKey,
 } from "../helpers/idempotencyHelper.js";
+import { resolvePermissions } from "../helpers/roleHelper.js";
+import { Role } from "../models/roles.js";
 import { User } from "../models/users.js";
 
 export const loginController = async (req: Request, res: Response) => {
@@ -72,8 +74,14 @@ export const loginController = async (req: Request, res: Response) => {
 		return res.status(200).json({
 			success: true,
 			message: "ok",
-			token: signAccessToken(user._id, user.email),
+			token: signAccessToken(
+				user._id,
+				user.email,
+				user.roles,
+				await resolvePermissions(user.roles),
+			),
 			username: user.username,
+			roles: user.roles,
 		});
 	} catch (_error) {
 		console.error(_error);
@@ -88,7 +96,7 @@ export const loginController = async (req: Request, res: Response) => {
 
 export const registerController = async (req: Request, res: Response) => {
 	try {
-		const { username, email, password } = req.body;
+		const { username, email, password, roles } = req.body;
 
 		const existingUser = await User.findOne({ email });
 		if (existingUser) {
@@ -97,12 +105,22 @@ export const registerController = async (req: Request, res: Response) => {
 				.json({ success: false, message: "El email ya está registrado" });
 		}
 
+		if (roles) {
+			const found = await Role.countDocuments({ name: { $in: roles } });
+			if (found !== new Set(roles).size) {
+				return res
+					.status(400)
+					.json({ success: false, message: "Rol inexistente" });
+			}
+		}
+
 		const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
 
 		const newUser = await User.create({
 			username,
 			email,
 			password: hashedPassword,
+			roles,
 		});
 
 		return res.status(201).json({
@@ -145,12 +163,29 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 				.json({ success: false, message: "Refresh token inválido" });
 		}
 
+		// Roles y permisos desde Mongo y no desde la sesion: un cambio de rol,
+		// de permisos o una baja aplica en el proximo refresh, sin nuevo login.
+		const user = await User.findById(session.userId, { roles: 1 }).lean();
+		if (!user) {
+			await deleteSession(hashSessionToken(cookieSessionToken));
+			clearSessionCookie(res);
+			return res
+				.status(403)
+				.json({ success: false, message: "Refresh token inválido" });
+		}
+
 		// Mismo token, vencimiento renovado: la cookie acompaña al TTL de Redis.
 		setSessionCookie(res, cookieSessionToken);
 		return res.status(200).json({
 			success: true,
 			message: "ok",
-			token: signAccessToken(session.userId, session.username),
+			token: signAccessToken(
+				session.userId,
+				session.username,
+				user.roles,
+				await resolvePermissions(user.roles),
+			),
+			roles: user.roles,
 		});
 	} catch (_error) {
 		console.error(_error);

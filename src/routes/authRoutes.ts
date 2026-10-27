@@ -11,7 +11,7 @@ import {
 	loginUserIpRateLimit,
 } from "../middlewares/loginRateLimit.js";
 import { validate } from "../middlewares/validate.js";
-import { verifyToken } from "../middlewares/verifyToken.js";
+import { requirePermission, verifyToken } from "../middlewares/verifyToken.js";
 import { verifyTurnstile } from "../middlewares/verifyTurnstile.js";
 import { loginSchema, registerSchema } from "../validators/authZodSchema.js";
 
@@ -28,6 +28,7 @@ authRouter.post(
 authRouter.post(
 	"/register",
 	verifyToken,
+	requirePermission("users:create"),
 	validate(registerSchema),
 	registerController,
 );
