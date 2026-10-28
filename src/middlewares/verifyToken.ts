@@ -1,7 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import jwt from "jsonwebtoken";
-import { resolvePermissions } from "../helpers/roleHelper.js";
-import type { Permission } from "../models/roles.js";
+import { Route } from "../models/routes.js";
 import {
 	accessTokenPayloadSchema,
 	bearerHeaderSchema,
@@ -85,22 +84,35 @@ export const verifyToken = (
 	return next();
 };
 
+const forbidden = (res: Response) =>
+	res.status(403).json({ success: false, message: "Permisos insuficientes" });
+
 /**
- * Va despues de verifyToken: deja pasar solo si los roles del token suman
- * TODOS los permisos. Los permisos se leen de Mongo en cada request, asi que
- * un cambio en un rol aplica al instante; los roles del usuario, recien en
- * el proximo refresh.
+ * Va despues de verifyToken. Deja pasar si alguno de los roles del token
+ * esta en `roles` del documento Route llamado `routeName`.
+ *
+ * Una ruta sin documento en Route se rechaza: olvidarse de cargarla no
+ * puede dejarla abierta. Route se lee en cada request (un cambio aplica al
+ * instante); los roles del usuario, recien en el proximo refresh.
  */
-export const requirePermission =
-	(...required: Permission[]) =>
+export const requireAccess =
+	(routeName: string) =>
 	async (req: Request, res: Response, next: NextFunction) => {
 		try {
-			const granted = await resolvePermissions(req.user?.roles ?? []);
-			if (!required.every((permission) => granted.includes(permission))) {
-				return res
-					.status(403)
-					.json({ success: false, message: "Permisos insuficientes" });
+			const route = await Route.findOne(
+				{ name: routeName },
+				{ roles: 1 },
+			).lean();
+			if (!route) {
+				console.warn(`requireAccess: falta la ruta "${routeName}" en Route`);
+				return forbidden(res);
 			}
+
+			const routeRoles = new Set(route.roles.map(String));
+			if (!(req.user?.roles ?? []).some((id) => routeRoles.has(id))) {
+				return forbidden(res);
+			}
+
 			return next();
 		} catch (error) {
 			console.error(error);

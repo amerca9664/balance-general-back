@@ -43,7 +43,7 @@ export const bearerHeaderSchema = z
 /**
  * Forma del payload de un access token firmado por este back
  * (`{ id, username, roles }` en login y en refresh; `roles` son los _id
- * de Role, los permisos se leen de Mongo en requirePermission).
+ * de Role, los permisos se leen de Mongo en requireAccess).
  * Zod descarta las claves extra (`iat`, `exp`, `alg`, y `permissions` de
  * tokens viejos) al parsear. Tokens viejos sin `roles` quedan en [].
  */
