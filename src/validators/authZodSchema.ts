@@ -12,12 +12,6 @@ export const registerSchema = z.object({
 		.min(3, "El nombre de usuario debe tener al menos 3 caracteres"),
 	email: z.string().email("El email no es válido"),
 	password: z.string().min(6, "La contraseña debe tener al menos 6 caracteres"),
-	// _id de Role. El formato se valida aca (si no, Mongo tira CastError y
-	// sale un 500); que existan lo chequea registerController.
-	roles: z
-		.array(z.string().regex(/^[a-f\d]{24}$/i, "Rol inválido"))
-		.nonempty()
-		.optional(),
 });
 
 /**

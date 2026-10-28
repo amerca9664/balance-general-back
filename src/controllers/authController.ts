@@ -1,6 +1,5 @@
 import bcrypt from "bcrypt";
 import type { Request, Response } from "express";
-import type { Types } from "mongoose";
 import {
 	clearSessionCookie,
 	createSession,
@@ -17,7 +16,6 @@ import {
 	releaseIdempotencyKey,
 	storeIdempotencyKey,
 } from "../helpers/idempotencyHelper.js";
-import { Role } from "../models/roles.js";
 import { User } from "../models/users.js";
 import type { RegisterInput } from "../validators/authZodSchema.js";
 
@@ -91,7 +89,7 @@ export const loginController = async (req: Request, res: Response) => {
 
 export const registerController = async (req: Request, res: Response) => {
 	try {
-		const { username, email, password, roles } = req.body as RegisterInput;
+		const { username, email, password } = req.body as RegisterInput;
 
 		const existingUser = await User.findOne({ email });
 		if (existingUser) {
@@ -100,35 +98,13 @@ export const registerController = async (req: Request, res: Response) => {
 				.json({ success: false, message: "El email ya está registrado" });
 		}
 
-		let roleIds: (Types.ObjectId | string)[];
-		if (roles) {
-			// Minusculas: el mismo _id en mayusculas no debe contar dos veces.
-			roleIds = [...new Set(roles.map((id) => id.toLowerCase()))];
-			const found = await Role.countDocuments({ _id: { $in: roleIds } });
-			if (found !== roleIds.length) {
-				return res
-					.status(400)
-					.json({ success: false, message: "Rol inexistente" });
-			}
-		} else {
-			// Sin roles en el body: el rol "user", que tiene que existir en Mongo.
-			const defaultRole = await Role.exists({ name: "user" });
-			if (!defaultRole) {
-				return res.status(400).json({
-					success: false,
-					message: 'No existe el rol por defecto "user"',
-				});
-			}
-			roleIds = [defaultRole._id];
-		}
-
 		const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
 
+		// Sin roles: se asignan aparte (por ahora a mano en Mongo).
 		const newUser = await User.create({
 			username,
 			email,
 			password: hashedPassword,
-			roles: roleIds,
 		});
 
 		return res.status(201).json({
