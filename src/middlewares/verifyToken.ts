@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import jwt from "jsonwebtoken";
+import { resolvePermissions } from "../helpers/roleHelper.js";
 import type { Permission } from "../models/roles.js";
 import {
 	accessTokenPayloadSchema,
@@ -74,30 +75,37 @@ export const verifyToken = (
 		});
 	}
 
-	const { id, username, roles, permissions } = payloadParsed.data;
+	const { id, username, roles } = payloadParsed.data;
 	req.user = {
 		id,
 		username: username ?? "",
 		roles,
-		permissions,
 	};
 
 	return next();
 };
 
 /**
- * Va despues de verifyToken: deja pasar solo si el usuario tiene TODOS los
- * permisos. Lee el token, no Mongo: un cambio de permisos aplica en el
- * proximo refresh.
+ * Va despues de verifyToken: deja pasar solo si los roles del token suman
+ * TODOS los permisos. Los permisos se leen de Mongo en cada request, asi que
+ * un cambio en un rol aplica al instante; los roles del usuario, recien en
+ * el proximo refresh.
  */
 export const requirePermission =
 	(...required: Permission[]) =>
-	(req: Request, res: Response, next: NextFunction) => {
-		const granted = req.user?.permissions ?? [];
-		if (!required.every((permission) => granted.includes(permission))) {
+	async (req: Request, res: Response, next: NextFunction) => {
+		try {
+			const granted = await resolvePermissions(req.user?.roles ?? []);
+			if (!required.every((permission) => granted.includes(permission))) {
+				return res
+					.status(403)
+					.json({ success: false, message: "Permisos insuficientes" });
+			}
+			return next();
+		} catch (error) {
+			console.error(error);
 			return res
-				.status(403)
-				.json({ success: false, message: "Permisos insuficientes" });
+				.status(500)
+				.json({ success: false, message: "Error interno del servidor" });
 		}
-		return next();
 	};

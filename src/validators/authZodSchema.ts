@@ -1,5 +1,4 @@
 import { z } from "zod";
-import { PERMISSIONS, type Permission } from "../models/roles.js";
 
 export const loginSchema = z.object({
 	email: z.string().email("El email no es válido"),
@@ -13,8 +12,12 @@ export const registerSchema = z.object({
 		.min(3, "El nombre de usuario debe tener al menos 3 caracteres"),
 	email: z.string().email("El email no es válido"),
 	password: z.string().min(6, "La contraseña debe tener al menos 6 caracteres"),
-	// Que existan en la coleccion Role lo chequea registerController.
-	roles: z.array(z.string().min(1)).nonempty().optional(),
+	// _id de Role. El formato se valida aca (si no, Mongo tira CastError y
+	// sale un 500); que existan lo chequea registerController.
+	roles: z
+		.array(z.string().regex(/^[a-f\d]{24}$/i, "Rol inválido"))
+		.nonempty()
+		.optional(),
 });
 
 /**
@@ -39,22 +42,15 @@ export const bearerHeaderSchema = z
 
 /**
  * Forma del payload de un access token firmado por este back
- * (`{ id, username, roles, permissions }` en login y en refresh).
- * Zod descarta las claves extra (`iat`, `exp`, `alg`) al parsear.
- * Permisos desconocidos se descartan; tokens viejos sin estos campos quedan en [].
+ * (`{ id, username, roles }` en login y en refresh; `roles` son los _id
+ * de Role, los permisos se leen de Mongo en requirePermission).
+ * Zod descarta las claves extra (`iat`, `exp`, `alg`, y `permissions` de
+ * tokens viejos) al parsear. Tokens viejos sin `roles` quedan en [].
  */
 export const accessTokenPayloadSchema = z.object({
 	id: z.string().min(1, "Token inválido"),
 	username: z.string().optional(),
 	roles: z.array(z.string()).default([]),
-	permissions: z
-		.array(z.string())
-		.default([])
-		.transform((permissions) =>
-			permissions.filter((p): p is Permission =>
-				(PERMISSIONS as readonly string[]).includes(p),
-			),
-		),
 });
 
 export type LoginInput = z.infer<typeof loginSchema>;

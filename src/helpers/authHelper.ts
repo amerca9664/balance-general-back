@@ -93,15 +93,10 @@ export const signAccessToken = (
 	id: unknown,
 	username: string | undefined,
 	roles: string[],
-	permissions: string[],
 ): string =>
-	jwt.sign(
-		{ id, username, roles, permissions },
-		process.env.JWT_SECRET as string,
-		{
-			expiresIn: ACCESS_TOKEN_TTL_MINUTES * 60, // en segundos
-		},
-	);
+	jwt.sign({ id, username, roles }, process.env.JWT_SECRET as string, {
+		expiresIn: ACCESS_TOKEN_TTL_MINUTES * 60, // en segundos
+	});
 
 export const setSessionCookie = (res: Response, token: string): void => {
 	res.cookie("jwt", token, {

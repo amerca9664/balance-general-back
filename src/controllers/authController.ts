@@ -1,5 +1,6 @@
 import bcrypt from "bcrypt";
 import type { Request, Response } from "express";
+import type { Types } from "mongoose";
 import {
 	clearSessionCookie,
 	createSession,
@@ -16,9 +17,9 @@ import {
 	releaseIdempotencyKey,
 	storeIdempotencyKey,
 } from "../helpers/idempotencyHelper.js";
-import { resolvePermissions } from "../helpers/roleHelper.js";
 import { Role } from "../models/roles.js";
 import { User } from "../models/users.js";
+import type { RegisterInput } from "../validators/authZodSchema.js";
 
 export const loginController = async (req: Request, res: Response) => {
 	const { email, password, idempotencyKey } = req.body;
@@ -74,14 +75,8 @@ export const loginController = async (req: Request, res: Response) => {
 		return res.status(200).json({
 			success: true,
 			message: "ok",
-			token: signAccessToken(
-				user._id,
-				user.email,
-				user.roles,
-				await resolvePermissions(user.roles),
-			),
+			token: signAccessToken(user._id, user.email, user.roles.map(String)),
 			username: user.username,
-			roles: user.roles,
 		});
 	} catch (_error) {
 		console.error(_error);
@@ -96,7 +91,7 @@ export const loginController = async (req: Request, res: Response) => {
 
 export const registerController = async (req: Request, res: Response) => {
 	try {
-		const { username, email, password, roles } = req.body;
+		const { username, email, password, roles } = req.body as RegisterInput;
 
 		const existingUser = await User.findOne({ email });
 		if (existingUser) {
@@ -105,13 +100,26 @@ export const registerController = async (req: Request, res: Response) => {
 				.json({ success: false, message: "El email ya está registrado" });
 		}
 
+		let roleIds: (Types.ObjectId | string)[];
 		if (roles) {
-			const found = await Role.countDocuments({ name: { $in: roles } });
-			if (found !== new Set(roles).size) {
+			// Minusculas: el mismo _id en mayusculas no debe contar dos veces.
+			roleIds = [...new Set(roles.map((id) => id.toLowerCase()))];
+			const found = await Role.countDocuments({ _id: { $in: roleIds } });
+			if (found !== roleIds.length) {
 				return res
 					.status(400)
 					.json({ success: false, message: "Rol inexistente" });
 			}
+		} else {
+			// Sin roles en el body: el rol "user", que tiene que existir en Mongo.
+			const defaultRole = await Role.exists({ name: "user" });
+			if (!defaultRole) {
+				return res.status(400).json({
+					success: false,
+					message: 'No existe el rol por defecto "user"',
+				});
+			}
+			roleIds = [defaultRole._id];
 		}
 
 		const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
@@ -120,7 +128,7 @@ export const registerController = async (req: Request, res: Response) => {
 			username,
 			email,
 			password: hashedPassword,
-			roles,
+			roles: roleIds,
 		});
 
 		return res.status(201).json({
@@ -163,8 +171,8 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 				.json({ success: false, message: "Refresh token inválido" });
 		}
 
-		// Roles y permisos desde Mongo y no desde la sesion: un cambio de rol,
-		// de permisos o una baja aplica en el proximo refresh, sin nuevo login.
+		// Roles desde Mongo y no desde la sesion: un cambio de roles del
+		// usuario o una baja aplica en el proximo refresh, sin nuevo login.
 		const user = await User.findById(session.userId, { roles: 1 }).lean();
 		if (!user) {
 			await deleteSession(hashSessionToken(cookieSessionToken));
@@ -182,10 +190,8 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 			token: signAccessToken(
 				session.userId,
 				session.username,
-				user.roles,
-				await resolvePermissions(user.roles),
+				user.roles.map(String),
 			),
-			roles: user.roles,
 		});
 	} catch (_error) {
 		console.error(_error);

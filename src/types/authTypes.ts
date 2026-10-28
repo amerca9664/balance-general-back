@@ -1,8 +1,6 @@
-import type { Permission } from "../models/roles.js";
-
 export type AuthUser = {
 	id: string;
 	username: string;
+	// _id de Role, como string.
 	roles: string[];
-	permissions: Permission[];
 };
