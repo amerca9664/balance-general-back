@@ -28,7 +28,7 @@ authRouter.post(
 authRouter.post(
 	"/register",
 	verifyToken,
-	requirePermission("users:create"),
+	requirePermission("write"),
 	validate(registerSchema),
 	registerController,
 );

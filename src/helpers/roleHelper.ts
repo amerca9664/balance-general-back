@@ -1,6 +1,9 @@
-import { type Permission, Role } from "../models/roles.js";
+import { PERMISSIONS, type Permission, Role } from "../models/roles.js";
 
-/** Une los permisos de todos los roles. Un rol que ya no existe no aporta nada. */
+/**
+ * Une los permisos de todos los roles: un permiso queda si algun rol lo
+ * tiene en true. Un rol que ya no existe no aporta nada.
+ */
 export const resolvePermissions = async (
 	roleNames: string[],
 ): Promise<Permission[]> => {
@@ -8,7 +11,7 @@ export const resolvePermissions = async (
 		{ name: { $in: roleNames } },
 		{ permissions: 1 },
 	).lean();
-	return [
-		...new Set(roles.flatMap((role) => role.permissions as Permission[])),
-	];
+	return PERMISSIONS.filter((permission) =>
+		roles.some((role) => role.permissions?.[permission] === true),
+	);
 };
