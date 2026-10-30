@@ -4,6 +4,7 @@ import express, { type Express, type Request, type Response } from "express";
 import { connectDb } from "./dbs/mongoDb.js";
 import { connectRedis } from "./dbs/redis.js";
 import { authRouter } from "./routes/authRoutes.js";
+import { userRouter } from "./routes/userRoutes.js";
 
 const app: Express = express();
 app.use(
@@ -23,6 +24,7 @@ app.get("/", (_req: Request, res: Response) => {
 	res.status(200).send("Hello World!");
 });
 app.use("/api/auth", authRouter);
+app.use("/api/users", userRouter);
 app.listen(port, () => {
 	console.log(`Server running on port ${port}`);
 });

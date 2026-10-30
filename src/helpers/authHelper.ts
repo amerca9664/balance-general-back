@@ -49,7 +49,7 @@ const SESSION_MAX_AGE_MS = SESSION_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
 const MAX_SESSIONS_PER_USER = readPositiveIntEnv("MAX_SESSIONS_PER_USER", 5);
 
 // bcrypt solo acepta 4..31 rounds: por debajo es debil, por encima lanza y
-// rompe /register con un 500. El clamp evita que una env var mal escrita
+// rompe POST /users con un 500. El clamp evita que una env var mal escrita
 // tire el registro de usuarios.
 export const SALT_ROUNDS = Math.min(
 	31,

@@ -3,7 +3,7 @@ import mongoose from "mongoose";
 const { Schema } = mongoose;
 
 // Quien puede entrar a cada endpoint. `name` es la clave que el endpoint
-// pasa a requireAccess (ej. "auth.register"), no el path.
+// pasa a requireAccess (ej. "users.write"), no el path.
 const routeSchema = new Schema({
 	name: {
 		type: String,

@@ -7,7 +7,6 @@ import {
 	generateSessionToken,
 	getRequestMeta,
 	hashSessionToken,
-	SALT_ROUNDS,
 	setSessionCookie,
 	signAccessToken,
 	touchSession,
@@ -17,7 +16,6 @@ import {
 	storeIdempotencyKey,
 } from "../helpers/idempotencyHelper.js";
 import { User } from "../models/users.js";
-import type { RegisterInput } from "../validators/authZodSchema.js";
 
 export const loginController = async (req: Request, res: Response) => {
 	const { email, password, idempotencyKey } = req.body;
@@ -81,39 +79,6 @@ export const loginController = async (req: Request, res: Response) => {
 		if (reserved) {
 			await releaseIdempotencyKey(owner, idempotencyKey).catch(console.error);
 		}
-		return res
-			.status(500)
-			.json({ success: false, message: "Error interno del servidor" });
-	}
-};
-
-export const registerController = async (req: Request, res: Response) => {
-	try {
-		const { username, email, password } = req.body as RegisterInput;
-
-		const existingUser = await User.findOne({ email });
-		if (existingUser) {
-			return res
-				.status(409)
-				.json({ success: false, message: "El email ya está registrado" });
-		}
-
-		const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
-
-		// Sin roles: se asignan aparte (por ahora a mano en Mongo).
-		const newUser = await User.create({
-			username,
-			email,
-			password: hashedPassword,
-		});
-
-		return res.status(201).json({
-			success: true,
-			message: "Usuario registrado",
-			data: { id: newUser._id },
-		});
-	} catch (_error) {
-		console.error(_error);
 		return res
 			.status(500)
 			.json({ success: false, message: "Error interno del servidor" });

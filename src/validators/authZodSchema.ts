@@ -6,14 +6,6 @@ export const loginSchema = z.object({
 	idempotencyKey: z.string().min(1, "Falta idempotency key"),
 });
 
-export const registerSchema = z.object({
-	username: z
-		.string()
-		.min(3, "El nombre de usuario debe tener al menos 3 caracteres"),
-	email: z.string().email("El email no es válido"),
-	password: z.string().min(6, "La contraseña debe tener al menos 6 caracteres"),
-});
-
 /**
  * Valida el header `Authorization` completo y deja solo el token.
  *
@@ -48,6 +40,5 @@ export const accessTokenPayloadSchema = z.object({
 });
 
 export type LoginInput = z.infer<typeof loginSchema>;
-export type RegisterInput = z.infer<typeof registerSchema>;
 export type BearerHeaderInput = z.infer<typeof bearerHeaderSchema>;
 export type AccessTokenPayloadInput = z.infer<typeof accessTokenPayloadSchema>;

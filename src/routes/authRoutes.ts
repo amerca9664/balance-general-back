@@ -4,16 +4,15 @@ import {
 	loginController,
 	logoutController,
 	meController,
-	registerController,
 } from "../controllers/authController.js";
 import {
 	loginIpRateLimit,
 	loginUserIpRateLimit,
 } from "../middlewares/loginRateLimit.js";
 import { validate } from "../middlewares/validate.js";
-import { requireAccess, verifyToken } from "../middlewares/verifyToken.js";
+import { verifyToken } from "../middlewares/verifyToken.js";
 import { verifyTurnstile } from "../middlewares/verifyTurnstile.js";
-import { loginSchema, registerSchema } from "../validators/authZodSchema.js";
+import { loginSchema } from "../validators/authZodSchema.js";
 
 const authRouter: ReturnType<typeof Router> = Router();
 
@@ -24,13 +23,6 @@ authRouter.post(
 	loginIpRateLimit,
 	loginUserIpRateLimit,
 	loginController,
-);
-authRouter.post(
-	"/register",
-	verifyToken,
-	requireAccess("auth.register"),
-	validate(registerSchema),
-	registerController,
 );
 authRouter.post("/refresh", handleRefreshToken);
 authRouter.post("/logout", logoutController);
