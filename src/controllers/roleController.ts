@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
 import mongoose from "mongoose";
+import { Department } from "../models/departments.js";
 import { Role } from "../models/roles.js";
 import { Route } from "../models/routes.js";
 import { User } from "../models/users.js";
@@ -26,6 +27,11 @@ const duplicateName = (res: Response) =>
 const isDuplicateKey = (error: unknown) =>
 	(error as { code?: number }).code === 11000;
 
+const invalidDepartment = (res: Response) =>
+	res
+		.status(400)
+		.json({ success: false, message: "El departamento no existe" });
+
 export const listRolesController = async (_req: Request, res: Response) => {
 	try {
 		const roles = await Role.find().lean();
@@ -37,10 +43,16 @@ export const listRolesController = async (_req: Request, res: Response) => {
 
 export const createRoleController = async (req: Request, res: Response) => {
 	try {
-		const { name, userType, permissions } = req.body as CreateRoleInput;
+		const { name, userType, department, permissions } =
+			req.body as CreateRoleInput;
+		if (!(await Department.exists({ _id: department }))) {
+			return invalidDepartment(res);
+		}
+
 		const role = await Role.create({
 			name,
 			userType,
+			department,
 			permissions: {
 				read: permissions?.read ?? false,
 				write: permissions?.write ?? false,
@@ -64,10 +76,16 @@ export const updateRoleController = async (req: Request, res: Response) => {
 		if (!mongoose.isValidObjectId(id)) return notFound(res);
 
 		// Rutas con punto para no pisar el permiso que no se envia.
-		const { name, userType, permissions } = req.body as UpdateRoleInput;
+		const { name, userType, department, permissions } =
+			req.body as UpdateRoleInput;
+		if (department && !(await Department.exists({ _id: department }))) {
+			return invalidDepartment(res);
+		}
+
 		const update = {
 			...(name ? { name } : {}),
 			...(userType ? { userType } : {}),
+			...(department ? { department } : {}),
 			...(permissions?.read !== undefined
 				? { "permissions.read": permissions.read }
 				: {}),

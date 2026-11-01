@@ -2,6 +2,7 @@ import bcrypt from "bcrypt";
 import type { Request, Response } from "express";
 import mongoose from "mongoose";
 import { SALT_ROUNDS } from "../helpers/authHelper.js";
+import { Role } from "../models/roles.js";
 import { User } from "../models/users.js";
 import type {
 	CreateUserInput,
@@ -18,10 +19,22 @@ const serverError = (res: Response, error: unknown) => {
 const notFound = (res: Response) =>
 	res.status(404).json({ success: false, message: "Usuario no encontrado" });
 
+const invalidRoles = (res: Response) =>
+	res.status(400).json({ success: false, message: "Algún rol no existe" });
+
+// Sin duplicados y todos existentes en Role; null si alguno falta.
+const resolveRoles = async (roles: string[]) => {
+	const unique = [...new Set(roles)];
+	const found = await Role.countDocuments({ _id: { $in: unique } });
+	return found === unique.length ? unique : null;
+};
+
+const USER_PROJECTION = { username: 1, email: 1, roles: 1 };
+
 // shortcut: sin paginacion, devuelve todos; paginar cuando sean miles.
 export const listUsersController = async (_req: Request, res: Response) => {
 	try {
-		const users = await User.find({}, { username: 1, email: 1 }).lean();
+		const users = await User.find({}, USER_PROJECTION).lean();
 		return res.status(200).json({ success: true, data: users });
 	} catch (error) {
 		return serverError(res, error);
@@ -30,7 +43,15 @@ export const listUsersController = async (_req: Request, res: Response) => {
 
 export const createUserController = async (req: Request, res: Response) => {
 	try {
-		const { username, email, password } = req.body as CreateUserInput;
+		const {
+			username,
+			email,
+			password,
+			roles = [],
+		} = req.body as CreateUserInput;
+
+		const roleIds = await resolveRoles(roles);
+		if (!roleIds) return invalidRoles(res);
 
 		const existingUser = await User.findOne({ email });
 		if (existingUser) {
@@ -41,11 +62,11 @@ export const createUserController = async (req: Request, res: Response) => {
 
 		const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
 
-		// Sin roles: se asignan aparte (por ahora a mano en Mongo).
 		const newUser = await User.create({
 			username,
 			email,
 			password: hashedPassword,
+			roles: roleIds,
 		});
 
 		return res.status(201).json({
@@ -67,8 +88,13 @@ export const updateUserController = async (req: Request, res: Response) => {
 		if (!mongoose.isValidObjectId(id)) return notFound(res);
 
 		// Solo estos campos: validate no recorta el body, asi que nada mas se cuela.
-		const { username, email, password } = req.body as UpdateUserInput;
+		const { username, email, password, roles } = req.body as UpdateUserInput;
+		const roleIds = roles ? await resolveRoles(roles) : undefined;
+		if (roleIds === null) return invalidRoles(res);
+
+		// Los roles nuevos entran al token en el proximo refresh.
 		const update = {
+			...(roleIds ? { roles: roleIds } : {}),
 			...(username ? { username } : {}),
 			...(email ? { email } : {}),
 			...(password
@@ -78,7 +104,7 @@ export const updateUserController = async (req: Request, res: Response) => {
 
 		const user = await User.findByIdAndUpdate(id, update, {
 			new: true,
-			projection: { username: 1, email: 1 },
+			projection: USER_PROJECTION,
 		}).lean();
 		if (!user) return notFound(res);
 

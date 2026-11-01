@@ -20,6 +20,11 @@ const roleSchema = new Schema({
 		enum: USER_TYPES,
 		required: true,
 	},
+	department: {
+		type: Schema.Types.ObjectId,
+		ref: "Department",
+		required: true,
+	},
 });
 const Role = mongoose.model("Role", roleSchema);
 

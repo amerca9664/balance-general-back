@@ -4,6 +4,7 @@ import express, { type Express, type Request, type Response } from "express";
 import { connectDb } from "./dbs/mongoDb.js";
 import { connectRedis } from "./dbs/redis.js";
 import { authRouter } from "./routes/authRoutes.js";
+import { departmentRouter } from "./routes/departmentRoutes.js";
 import { roleRouter } from "./routes/roleRoutes.js";
 import { userRouter } from "./routes/userRoutes.js";
 
@@ -27,6 +28,7 @@ app.get("/", (_req: Request, res: Response) => {
 app.use("/api/auth", authRouter);
 app.use("/api/users", userRouter);
 app.use("/api/roles", roleRouter);
+app.use("/api/departments", departmentRouter);
 app.listen(port, () => {
 	console.log(`Server running on port ${port}`);
 });
