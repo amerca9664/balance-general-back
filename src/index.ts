@@ -6,6 +6,7 @@ import { connectRedis } from "./dbs/redis.js";
 import { authRouter } from "./routes/authRoutes.js";
 import { departmentRouter } from "./routes/departmentRoutes.js";
 import { roleRouter } from "./routes/roleRoutes.js";
+import { routeRouter } from "./routes/routeRoutes.js";
 import { userRouter } from "./routes/userRoutes.js";
 
 const app: Express = express();
@@ -29,6 +30,7 @@ app.use("/api/auth", authRouter);
 app.use("/api/users", userRouter);
 app.use("/api/roles", roleRouter);
 app.use("/api/departments", departmentRouter);
+app.use("/api/routes", routeRouter);
 app.listen(port, () => {
 	console.log(`Server running on port ${port}`);
 });

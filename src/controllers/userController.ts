@@ -2,7 +2,7 @@ import bcrypt from "bcrypt";
 import type { Request, Response } from "express";
 import mongoose from "mongoose";
 import { SALT_ROUNDS } from "../helpers/authHelper.js";
-import { Role } from "../models/roles.js";
+import { resolveRoles } from "../helpers/roleHelper.js";
 import { User } from "../models/users.js";
 import type {
 	CreateUserInput,
@@ -21,13 +21,6 @@ const notFound = (res: Response) =>
 
 const invalidRoles = (res: Response) =>
 	res.status(400).json({ success: false, message: "Algún rol no existe" });
-
-// Sin duplicados y todos existentes en Role; null si alguno falta.
-const resolveRoles = async (roles: string[]) => {
-	const unique = [...new Set(roles)];
-	const found = await Role.countDocuments({ _id: { $in: unique } });
-	return found === unique.length ? unique : null;
-};
 
 const USER_PROJECTION = { username: 1, email: 1, roles: 1 };
 

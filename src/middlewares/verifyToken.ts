@@ -87,6 +87,10 @@ export const verifyToken = (
 const forbidden = (res: Response) =>
 	res.status(403).json({ success: false, message: "Permisos insuficientes" });
 
+// Cada clave usada con requireAccess. Se llena al cargar los routers (antes de
+// que el server escuche), asi el CRUD de rutas no necesita una lista a mano.
+export const registeredRouteNames = new Set<string>();
+
 /**
  * Va despues de verifyToken. Deja pasar si alguno de los roles del token
  * esta en `roles` del documento Route llamado `routeName`.
@@ -95,9 +99,9 @@ const forbidden = (res: Response) =>
  * puede dejarla abierta. Route se lee en cada request (un cambio aplica al
  * instante); los roles del usuario, recien en el proximo refresh.
  */
-export const requireAccess =
-	(routeName: string) =>
-	async (req: Request, res: Response, next: NextFunction) => {
+export const requireAccess = (routeName: string) => {
+	registeredRouteNames.add(routeName);
+	return async (req: Request, res: Response, next: NextFunction) => {
 		try {
 			const route = await Route.findOne(
 				{ name: routeName },
@@ -121,3 +125,4 @@ export const requireAccess =
 				.json({ success: false, message: "Error interno del servidor" });
 		}
 	};
+};
