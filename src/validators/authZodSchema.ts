@@ -36,7 +36,18 @@ export const bearerHeaderSchema = z
 export const accessTokenPayloadSchema = z.object({
 	id: z.string().min(1, "Token inválido"),
 	username: z.string().optional(),
-	roles: z.array(z.string()).default([]),
+	// Mismo formato que TokenRole. Un token viejo (roles como _id sueltos) no
+	// pasa: da 401 hasta el proximo refresh del front (o recargar la pagina).
+	roles: z
+		.array(
+			z.object({
+				id: z.string(),
+				name: z.string(),
+				userType: z.string(),
+				permissions: z.object({ read: z.boolean(), write: z.boolean() }),
+			}),
+		)
+		.default([]),
 });
 
 export type LoginInput = z.infer<typeof loginSchema>;

@@ -87,19 +87,21 @@ export const verifyToken = (
 const forbidden = (res: Response) =>
 	res.status(403).json({ success: false, message: "Permisos insuficientes" });
 
-// Cada clave usada con requireAccess. Se llena al cargar los routers (antes de
-// que el server escuche), asi el CRUD de rutas no necesita una lista a mano.
+// Cada recurso usado con requireAccess. Se llena al cargar los routers (antes
+// de que el server escuche), asi el CRUD de rutas no necesita una lista a mano.
 export const registeredRouteNames = new Set<string>();
 
 /**
- * Va despues de verifyToken. Deja pasar si alguno de los roles del token
- * esta en `roles` del documento Route llamado `routeName`.
+ * Va despues de verifyToken. Deja pasar si algun rol del token esta en
+ * `roles` del documento Route llamado `routeName` Y ese rol tiene el permiso
+ * `action` (permissions.read / permissions.write del Role).
  *
  * Una ruta sin documento en Route se rechaza: olvidarse de cargarla no
  * puede dejarla abierta. Route se lee en cada request (un cambio aplica al
- * instante); los roles del usuario, recien en el proximo refresh.
+ * instante); los roles y sus permisos viajan en el token, asi que un cambio
+ * ahi aplica recien en el proximo refresh.
  */
-export const requireAccess = (routeName: string) => {
+export const requireAccess = (routeName: string, action: "read" | "write") => {
 	registeredRouteNames.add(routeName);
 	return async (req: Request, res: Response, next: NextFunction) => {
 		try {
@@ -113,7 +115,10 @@ export const requireAccess = (routeName: string) => {
 			}
 
 			const routeRoles = new Set(route.roles.map(String));
-			if (!(req.user?.roles ?? []).some((id) => routeRoles.has(id))) {
+			const allowed = (req.user?.roles ?? []).some(
+				(role) => routeRoles.has(role.id) && role.permissions[action],
+			);
+			if (!allowed) {
 				return forbidden(res);
 			}
 

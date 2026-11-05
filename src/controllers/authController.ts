@@ -15,6 +15,7 @@ import {
 	releaseIdempotencyKey,
 	storeIdempotencyKey,
 } from "../helpers/idempotencyHelper.js";
+import { loadTokenRoles } from "../helpers/roleHelper.js";
 import { User } from "../models/users.js";
 
 export const loginController = async (req: Request, res: Response) => {
@@ -71,7 +72,11 @@ export const loginController = async (req: Request, res: Response) => {
 		return res.status(200).json({
 			success: true,
 			message: "ok",
-			token: signAccessToken(user._id, user.email, user.roles.map(String)),
+			token: signAccessToken(
+				user._id,
+				user.email,
+				await loadTokenRoles(user.roles),
+			),
 			username: user.username,
 		});
 	} catch (_error) {
@@ -113,7 +118,8 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 		}
 
 		// Roles desde Mongo y no desde la sesion: un cambio de roles del
-		// usuario o una baja aplica en el proximo refresh, sin nuevo login.
+		// usuario, de los permisos de un rol o una baja aplica en el proximo
+		// refresh, sin nuevo login.
 		const user = await User.findById(session.userId, { roles: 1 }).lean();
 		if (!user) {
 			await deleteSession(hashSessionToken(cookieSessionToken));
@@ -131,7 +137,7 @@ export const handleRefreshToken = async (req: Request, res: Response) => {
 			token: signAccessToken(
 				session.userId,
 				session.username,
-				user.roles.map(String),
+				await loadTokenRoles(user.roles),
 			),
 		});
 	} catch (_error) {

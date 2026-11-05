@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { CookieOptions, Request, Response } from "express";
 import jwt from "jsonwebtoken";
 import { getRedisClient } from "../dbs/redis.js";
+import type { TokenRole } from "../types/authTypes.js";
 
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
@@ -92,7 +93,7 @@ export const hashSessionToken = (rawToken: string): string =>
 export const signAccessToken = (
 	id: unknown,
 	username: string | undefined,
-	roles: string[],
+	roles: TokenRole[],
 ): string =>
 	jwt.sign({ id, username, roles }, process.env.JWT_SECRET as string, {
 		expiresIn: ACCESS_TOKEN_TTL_MINUTES * 60, // en segundos
